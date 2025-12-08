@@ -116,6 +116,9 @@ __launch_bounds__(NUM_THREADS,
   G::prefill_swizzled_offsets(As[0][0], g.a, swizzled_offsets_A);
   G::prefill_swizzled_offsets(Bs[0][0], g.b, swizzled_offsets_B);
 
+  // Declare accumulators outside loop to enable register reuse
+  rt_fl<HALF_REG_BLOCK_M, HALF_REG_BLOCK_N, col_l, rt_16x16_s> C_accum[2][2];
+
   // Persistent loop: iterate over all tiles assigned to this workgroup
   for (int tile_id = persistent_wgid; tile_id < total_tiles;
        tile_id += NUM_PERSISTENT_WORKGROUPS) {
@@ -134,8 +137,7 @@ __launch_bounds__(NUM_THREADS,
     const int row = pid_m;
     const int col = pid_n;
 
-    // Initialize accumulator for this tile
-    rt_fl<HALF_REG_BLOCK_M, HALF_REG_BLOCK_N, col_l, rt_16x16_s> C_accum[2][2];
+    // Zero accumulator for this tile
     zero(C_accum[0][0]);
     zero(C_accum[0][1]);
     zero(C_accum[1][0]);
