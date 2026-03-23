@@ -1,9 +1,10 @@
 /**
  * HipKittens BF16 GEMM — MI300X (gfx942, CDNA3)
  *
- * Simple single-buffered design: load→compute→load.
- * No register prefetch buffers (avoids spills for large tiles).
- * v_mfma_f32_16x16x16bf16_1k — 16x16 output, K=16
+ * Double-buffered shared memory for true compute/memory overlap:
+ *   - Compute MFMAs on buffer[tic] while loading next tile to buffer[toc]
+ *   - No separate load phase — loads are issued before compute and complete during it
+ *   - v_mfma_f32_32x32x8_bf16 — 32x32 output, K=8
  */
 
 #include "kittens.cuh"
@@ -37,15 +38,21 @@ constexpr int NTHREADS = kittens::WARP_THREADS * NWARPS;
 
 constexpr int REG_M = BM / WM;
 constexpr int REG_N = BN / WN;
-// CDNA3: v_mfma_f32_32x32x8_bf16 — 32x32 output, K=8 (same as Triton uses)
 constexpr int DOT_SLICE = 8;
 constexpr int K_SLICES = BK / DOT_SLICE;
 constexpr int WGM = 4;
 
-using rt_c_s = ducks::rt_shape::rt_32x32;  // Accumulator: 32x32 output
-using rt_ab_s = ducks::rt_shape::rt_32x8;  // A/B fragment: 32 rows × 8 K cols
+using rt_c_s = ducks::rt_shape::rt_32x32;
+using rt_ab_s = ducks::rt_shape::rt_32x8;
+
+constexpr int MFMA_M = REG_M / 32;
+constexpr int MFMA_N = REG_N / 32;
 constexpr int a_f4pr = BK / 8;
 constexpr int b_f4pr = BK / 8;
+
+// Check double buffer fits in LDS
+static_assert((BM * BK + BN * BK) * 2 * sizeof(bf16) <= 65536,
+              "Double-buffered shared memory must fit in 64KB");
 
 __global__ __launch_bounds__(NTHREADS, 2)
 void gemm_kernel(const bf16* __restrict__ A,
@@ -53,8 +60,9 @@ void gemm_kernel(const bf16* __restrict__ A,
                  bf16* __restrict__ C,
                  int M, int N, int K) {
 
-    __shared__ bf16 smem_A[BM * BK];
-    __shared__ bf16 smem_B[BN * BK];
+    // Double-buffered shared memory
+    __shared__ bf16 smem_A[2][BM * BK];
+    __shared__ bf16 smem_B[2][BN * BK];
 
     rt_fl<REG_M, REG_N, col_l, rt_c_s> C_accum;
     zero(C_accum);
@@ -75,89 +83,140 @@ void gemm_kernel(const bf16* __restrict__ A,
     const int warp_col = kittens::warpid() % WN;
     const int lane = tid % 64;
     const int num_k = K / BK;
-    const int lr = lane % 16, lc = (lane / 16) * 4;
+    const int lr32 = lane % 32, lc32 = (lane / 32) * 4;
 
-    // === MAIN LOOP ===
+    // Pre-compute per-warp LDS base offsets (invariant across K-tiles)
+    const int a_warp_off = warp_row * REG_M * BK + lr32 * BK + lc32;
+    const int b_warp_off = warp_col * REG_N * BK + lr32 * BK + lc32;
+
+    int tic = 0, toc = 1;
+
+    // === PROLOGUE: Load first tile to buffer[tic] ===
+    {
+        float4* da = reinterpret_cast<float4*>(smem_A[tic]);
+        float4* db = reinterpret_cast<float4*>(smem_B[tic]);
+        for (int i = tid; i < BM * a_f4pr; i += NTHREADS) {
+            int r = i / a_f4pr, c4 = i % a_f4pr;
+            da[i] = reinterpret_cast<const float4*>(A + (row0 + r) * K)[c4];
+        }
+        for (int i = tid; i < BN * b_f4pr; i += NTHREADS) {
+            int r = i / b_f4pr, c4 = i % b_f4pr;
+            db[i] = reinterpret_cast<const float4*>(B + (col0 + r) * K)[c4];
+        }
+    }
+    __syncthreads();
+
+    // === MAIN LOOP: compute on tic, load next to toc ===
     #pragma unroll 1
-    for (int kt = 0; kt < num_k; ++kt) {
-        // --- Load tile to shared (issue all globals before waits) ---
+    for (int kt = 0; kt < num_k - 1; ++kt) {
+        // Issue BOTH global loads to registers (VMEM async — will overlap with compute)
+        const int next_k = (kt + 1) * BK;
+        // For 128x128x32: each thread loads exactly 1 float4 for A and 1 for B
+        // For larger tiles: more loads per thread (constexpr loop)
+        constexpr int A_PER_T = (BM * a_f4pr + NTHREADS - 1) / NTHREADS;
+        constexpr int B_PER_T = (BN * b_f4pr + NTHREADS - 1) / NTHREADS;
+        float4 a_reg[A_PER_T];
+        float4 b_reg[B_PER_T];
         {
-            const int cur_k = kt * BK;
-            float4* da = reinterpret_cast<float4*>(smem_A);
-            float4* db = reinterpret_cast<float4*>(smem_B);
-
-            // Each thread loads one float4 from A and one from B
-            // Issue BOTH global loads before writing to shared
-            const int a_total = BM * a_f4pr;
-            const int b_total = BN * b_f4pr;
-
-            // This loop handles cases where total > NTHREADS
-            for (int base = 0; base < max(a_total, b_total); base += NTHREADS) {
-                float4 a_val, b_val;
-                bool has_a = (base + tid) < a_total;
-                bool has_b = (base + tid) < b_total;
-                int a_idx = base + tid;
-                int b_idx = base + tid;
-
-                // Issue global loads (both non-blocking)
-                if (has_a) {
-                    int r = a_idx / a_f4pr, c4 = a_idx % a_f4pr;
-                    a_val = reinterpret_cast<const float4*>(A + (row0 + r) * K + cur_k)[c4];
+            #pragma unroll
+            for (int i = 0; i < A_PER_T; ++i) {
+                int idx = tid + i * NTHREADS;
+                if (idx < BM * a_f4pr) {
+                    int r = idx / a_f4pr, c4 = idx % a_f4pr;
+                    a_reg[i] = reinterpret_cast<const float4*>(A + (row0 + r) * K + next_k)[c4];
                 }
-                if (has_b) {
-                    int r = b_idx / b_f4pr, c4 = b_idx % b_f4pr;
-                    b_val = reinterpret_cast<const float4*>(B + (col0 + r) * K + cur_k)[c4];
+            }
+            #pragma unroll
+            for (int i = 0; i < B_PER_T; ++i) {
+                int idx = tid + i * NTHREADS;
+                if (idx < BN * b_f4pr) {
+                    int r = idx / b_f4pr, c4 = idx % b_f4pr;
+                    b_reg[i] = reinterpret_cast<const float4*>(B + (col0 + r) * K + next_k)[c4];
                 }
+            }
+        }
 
-                // Write to shared (compiler inserts vmcnt wait before use)
-                if (has_a) da[a_idx] = a_val;
-                if (has_b) db[b_idx] = b_val;
+        // Compute all K_SLICES on tic buffer (MFMA overlaps with VMEM loads above)
+        {
+            const bf16* a_base = smem_A[tic] + a_warp_off;
+            const bf16* b_base = smem_B[tic] + b_warp_off;
+
+            #pragma unroll
+            for (int ks = 0; ks < K_SLICES; ++ks) {
+                const int k_off = ks * DOT_SLICE;
+                #pragma unroll
+                for (int bm = 0; bm < MFMA_M; ++bm) {
+                    bf16_2* fp = &a_frag.tiles[bm][0].data[0];
+                    const bf16* tp = a_base + bm * 32 * BK + k_off;
+                    fp[0] = *reinterpret_cast<const bf16_2*>(tp);
+                    fp[1] = *reinterpret_cast<const bf16_2*>(tp + 2);
+                }
+                #pragma unroll
+                for (int bn = 0; bn < MFMA_N; ++bn) {
+                    bf16_2* fp = &b_frag.tiles[bn][0].data[0];
+                    const bf16* tp = b_base + bn * 32 * BK + k_off;
+                    fp[0] = *reinterpret_cast<const bf16_2*>(tp);
+                    fp[1] = *reinterpret_cast<const bf16_2*>(tp + 2);
+                }
+                mma_ABt(C_accum, a_frag, b_frag, C_accum);
+            }
+        }
+
+        // Wait for global loads, write to toc buffer, swap
+        asm volatile("s_waitcnt vmcnt(0)");
+        {
+            float4* da = reinterpret_cast<float4*>(smem_A[toc]);
+            float4* db = reinterpret_cast<float4*>(smem_B[toc]);
+            #pragma unroll
+            for (int i = 0; i < A_PER_T; ++i) {
+                int idx = tid + i * NTHREADS;
+                if (idx < BM * a_f4pr) da[idx] = a_reg[i];
+            }
+            #pragma unroll
+            for (int i = 0; i < B_PER_T; ++i) {
+                int idx = tid + i * NTHREADS;
+                if (idx < BN * b_f4pr) db[idx] = b_reg[i];
             }
         }
         __syncthreads();
+        tic ^= 1;
+        toc ^= 1;
+    }
 
-        // --- Compute all K_SLICES ---
+    // === LAST TILE: compute only ===
+    {
+        const bf16* a_base = smem_A[tic] + a_warp_off;
+        const bf16* b_base = smem_B[tic] + b_warp_off;
+
         #pragma unroll
         for (int ks = 0; ks < K_SLICES; ++ks) {
-            const bf16* ap = smem_A + warp_row * REG_M * BK + ks * DOT_SLICE;
-            const bf16* bp = smem_B + warp_col * REG_N * BK + ks * DOT_SLICE;
-            // v_mfma_f32_32x32x8_bf16: 32x32 output, K=8
-            // Data layout: row = lane % 32, col_base = (lane / 32) * 4
-            // Each thread holds 4 bf16 = bf16_2[2] for the K=8 input
-            const int lr32 = lane % 32, lc32 = (lane / 32) * 4;
+            const int k_off = ks * DOT_SLICE;
             #pragma unroll
-            for (int bm = 0; bm < REG_M / 32; ++bm) {
+            for (int bm = 0; bm < MFMA_M; ++bm) {
                 bf16_2* fp = &a_frag.tiles[bm][0].data[0];
-                const bf16* tp = ap + (bm * 32 + lr32) * BK + lc32;
+                const bf16* tp = a_base + bm * 32 * BK + k_off;
                 fp[0] = *reinterpret_cast<const bf16_2*>(tp);
                 fp[1] = *reinterpret_cast<const bf16_2*>(tp + 2);
             }
             #pragma unroll
-            for (int bn = 0; bn < REG_N / 32; ++bn) {
+            for (int bn = 0; bn < MFMA_N; ++bn) {
                 bf16_2* fp = &b_frag.tiles[bn][0].data[0];
-                const bf16* tp = bp + (bn * 32 + lr32) * BK + lc32;
+                const bf16* tp = b_base + bn * 32 * BK + k_off;
                 fp[0] = *reinterpret_cast<const bf16_2*>(tp);
                 fp[1] = *reinterpret_cast<const bf16_2*>(tp + 2);
             }
             mma_ABt(C_accum, a_frag, b_frag, C_accum);
         }
-
-        __syncthreads();
     }
 
-    // === EPILOGUE: 32x32 accumulator → BF16 output ===
-    // v_mfma_f32_32x32x8 output layout (gfx942):
-    //   Each thread holds 16 floats = float2[8]
-    //   4 blocks of 4 consecutive rows:
-    //   block b (0-3): row = (lane/32)*4 + b*8 + {0,1,2,3}, col = lane%32
+    // === EPILOGUE ===
     #pragma unroll
-    for (int bm = 0; bm < REG_M / 32; ++bm) {
+    for (int bm = 0; bm < MFMA_M; ++bm) {
         #pragma unroll
-        for (int bn = 0; bn < REG_N / 32; ++bn) {
+        for (int bn = 0; bn < MFMA_N; ++bn) {
             int c_col = lane % 32;
             float2* acc = &C_accum.tiles[bm][bn].data[0];
             int gc = col0 + warp_col * REG_N + bn * 32 + c_col;
-
             if (gc < N) {
                 bf16* out = C + gc;
                 #pragma unroll
