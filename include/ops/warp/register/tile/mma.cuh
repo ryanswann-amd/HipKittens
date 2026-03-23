@@ -26,6 +26,22 @@ __device__ static inline void mfma161616(      float2 (&D)[2],
     );
 }
 
+// --- CDNA3 (gfx942) MFMA: v_mfma_f32_32x32x8bf16_1k ---
+// 32x32 output, K=8, each thread: 4 bf16 in, 16 float out
+__device__ static inline void mfma32328(       float2 (&D)[8],
+                                         const bf16_2 (&A)[2],
+                                         const bf16_2 (&B)[2],
+                                         const float2 (&C)[8]) {
+    typedef __attribute__((__vector_size__(4 * sizeof(short)))) short v4i16;
+    typedef __attribute__((__vector_size__(16 * sizeof(float)))) float floatx16_t;
+    *(floatx16_t*)D = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(
+        *(v4i16*)(A),
+        *(v4i16*)(B),
+        *(floatx16_t*)C,
+        0, 0, 0
+    );
+}
+
 __device__ static inline void mfma161632(      float2 (&D)[2],
                                          const half_2 (&A)[4],
                                          const half_2 (&B)[4],
