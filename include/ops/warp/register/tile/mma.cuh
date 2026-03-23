@@ -228,8 +228,15 @@ __device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::col,
     constexpr int B_stride = B_shape::stride;
     static_assert(A_stride == B_stride, "A and B must have the same stride");
 
+    // CDNA3 (gfx942): v_mfma_f32_32x32x8_bf16 — 32x32 output, K=8
+    if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_32x32> &&
+                  A_rows == 32 && A_cols == 8 &&
+                  B_rows == 32 && B_cols == 8 &&
+                  std::is_same_v<C_shape, typename ducks::rt_shape::rt_32x32> &&
+                  std::is_same_v<MM_Operand_T, bf16>) {
+        mfma32328(d.data, a.data, b.data, c.data);
     // CDNA3 (gfx942): v_mfma_f32_16x16x16_bf16 — 16x16 output, K=16
-    if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_16x16> &&
+    } else if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_16x16> &&
                   A_rows == 16 && A_cols == 16 &&
                   B_rows == 16 && B_cols == 16 &&
                   std::is_same_v<C_shape, typename ducks::rt_shape::rt_16x16> &&
