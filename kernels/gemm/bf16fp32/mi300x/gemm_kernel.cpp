@@ -78,18 +78,38 @@ void gemm_kernel(const bf16* __restrict__ A,
     // === MAIN LOOP ===
     #pragma unroll 1
     for (int kt = 0; kt < num_k; ++kt) {
-        // --- Load tile to shared ---
+        // --- Load tile to shared (issue all globals before waits) ---
         {
             const int cur_k = kt * BK;
             float4* da = reinterpret_cast<float4*>(smem_A);
             float4* db = reinterpret_cast<float4*>(smem_B);
-            for (int i = tid; i < BM * a_f4pr; i += NTHREADS) {
-                int r = i / a_f4pr, c4 = i % a_f4pr;
-                da[i] = reinterpret_cast<const float4*>(A + (row0 + r) * K + cur_k)[c4];
-            }
-            for (int i = tid; i < BN * b_f4pr; i += NTHREADS) {
-                int r = i / b_f4pr, c4 = i % b_f4pr;
-                db[i] = reinterpret_cast<const float4*>(B + (col0 + r) * K + cur_k)[c4];
+
+            // Each thread loads one float4 from A and one from B
+            // Issue BOTH global loads before writing to shared
+            const int a_total = BM * a_f4pr;
+            const int b_total = BN * b_f4pr;
+
+            // This loop handles cases where total > NTHREADS
+            for (int base = 0; base < max(a_total, b_total); base += NTHREADS) {
+                float4 a_val, b_val;
+                bool has_a = (base + tid) < a_total;
+                bool has_b = (base + tid) < b_total;
+                int a_idx = base + tid;
+                int b_idx = base + tid;
+
+                // Issue global loads (both non-blocking)
+                if (has_a) {
+                    int r = a_idx / a_f4pr, c4 = a_idx % a_f4pr;
+                    a_val = reinterpret_cast<const float4*>(A + (row0 + r) * K + cur_k)[c4];
+                }
+                if (has_b) {
+                    int r = b_idx / b_f4pr, c4 = b_idx % b_f4pr;
+                    b_val = reinterpret_cast<const float4*>(B + (col0 + r) * K + cur_k)[c4];
+                }
+
+                // Write to shared (compiler inserts vmcnt wait before use)
+                if (has_a) da[a_idx] = a_val;
+                if (has_b) db[b_idx] = b_val;
             }
         }
         __syncthreads();
