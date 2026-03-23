@@ -10,6 +10,22 @@
 
 namespace kittens {
 
+// --- CDNA3 (gfx942) MFMA: v_mfma_f32_16x16x16bf16_1k ---
+// 16x16 output, K=16, each thread: 4 bf16 in, 4 float out
+__device__ static inline void mfma161616(      float2 (&D)[2],
+                                         const bf16_2 (&A)[2],
+                                         const bf16_2 (&B)[2],
+                                         const float2 (&C)[2]) {
+    typedef __attribute__((__vector_size__(4 * sizeof(short)))) short v4i16;
+    typedef __attribute__((__vector_size__(4 * sizeof(float)))) float floatx4_t;
+    *(floatx4_t*)D = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+        *(v4i16*)(A),
+        *(v4i16*)(B),
+        *(floatx4_t*)C,
+        0, 0, 0
+    );
+}
+
 __device__ static inline void mfma161632(      float2 (&D)[2],
                                          const half_2 (&A)[4],
                                          const half_2 (&B)[4],
@@ -196,7 +212,15 @@ __device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::col,
     constexpr int B_stride = B_shape::stride;
     static_assert(A_stride == B_stride, "A and B must have the same stride");
 
+    // CDNA3 (gfx942): v_mfma_f32_16x16x16_bf16 — 16x16 output, K=16
     if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_16x16> &&
+                  A_rows == 16 && A_cols == 16 &&
+                  B_rows == 16 && B_cols == 16 &&
+                  std::is_same_v<C_shape, typename ducks::rt_shape::rt_16x16> &&
+                  std::is_same_v<MM_Operand_T, bf16>) {
+        mfma161616(d.data, a.data, b.data, c.data);
+    // CDNA4 (gfx950): v_mfma_f32_16x16x32_bf16 — 16x16 output, K=32
+    } else if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_16x16> &&
                   A_rows == 16 && A_cols == 32 &&
                   B_rows == 16 && B_cols == 32 &&
                   std::is_same_v<C_shape, typename ducks::rt_shape::rt_16x16>) {
