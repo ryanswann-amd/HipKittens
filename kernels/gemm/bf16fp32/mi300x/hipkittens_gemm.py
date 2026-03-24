@@ -46,13 +46,16 @@ _KERNELS = {
     # FP16 NT
     ('fp16', 'nt', 256): 'hk_fp16_nt_256x256x64',
     ('fp16', 'nt', 128): 'hk_fp16_nt_128x128x64',
-    # FP16 NN
+    # FP16 NN (fused for 256x256)
+    ('fp16', 'nn', 256): 'hk_fp16_nn_fused_256x256x64',
     ('fp16', 'nn', 192): 'hk_fp16_nn_192x192x64',
     ('fp16', 'nn', 128): 'hk_fp16_nn_128x128x64',
-    # FP16 TT
+    # FP16 TT (fused for 256x256)
+    ('fp16', 'tt', 256): 'hk_fp16_tt_fused_256x256x64',
     ('fp16', 'tt', 192): 'hk_fp16_tt_192x192x64',
     ('fp16', 'tt', 128): 'hk_fp16_tt_128x128x64',
-    # FP16 TN
+    # FP16 TN (fused for 256x256)
+    ('fp16', 'tn', 256): 'hk_fp16_tn_fused_256x256x64',
     ('fp16', 'tn', 192): 'hk_fp16_tn_192x192x64',
     ('fp16', 'tn', 128): 'hk_fp16_tn_128x128x64',
 }
@@ -64,9 +67,9 @@ _TILE_PREF = {
     ('bf16', 'tt'): [256, 192, 128],  # 256=fused for large N
     ('bf16', 'tn'): [256, 192, 128],  # 256=fused for large N
     ('fp16', 'nt'): [256, 128],
-    ('fp16', 'nn'): [192, 128],
-    ('fp16', 'tt'): [192, 128],
-    ('fp16', 'tn'): [192, 128],
+    ('fp16', 'nn'): [256, 192, 128],
+    ('fp16', 'tt'): [256, 192, 128],
+    ('fp16', 'tn'): [256, 192, 128],
 }
 
 _loaded = {}
