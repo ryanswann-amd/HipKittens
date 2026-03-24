@@ -202,11 +202,23 @@ hk_fp16_tn_192x192x64$(PY_EXT): fp16_tn_kernel.cpp
 		-DBLOCK_SIZE_VAL=192 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_fp16_tn_192x192x64 \
 		-o $@ 2>&1
 
-# NN fused (transpose+NT) for large sizes
+# Fused (transpose+NT) kernels for large sizes — use NT kernel with pre-transposed inputs
 hk_nn_fused_256x256x64$(PY_EXT): nn_fused_kernel.cpp
 	$(HIPCXX) $< $(CDNA3_NN_FLAGS) \
 		-DBLOCK_SIZE_VAL=256 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_nn_fused_256x256x64 \
 		-o $@ 2>&1
+
+hk_tt_fused_256x256x64$(PY_EXT): tt_fused_kernel.cpp
+	$(HIPCXX) $< $(CDNA3_NN_FLAGS) \
+		-DBLOCK_SIZE_VAL=256 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_tt_fused_256x256x64 \
+		-o $@ 2>&1
+
+hk_tn_fused_256x256x64$(PY_EXT): tn_fused_kernel.cpp
+	$(HIPCXX) $< $(CDNA3_NN_FLAGS) \
+		-DBLOCK_SIZE_VAL=256 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_tn_fused_256x256x64 \
+		-o $@ 2>&1
+
+fused: hk_nn_fused_256x256x64$(PY_EXT) hk_tt_fused_256x256x64$(PY_EXT) hk_tn_fused_256x256x64$(PY_EXT)
 
 fp16_tt: hk_fp16_tt_128x128x64$(PY_EXT) hk_fp16_tt_192x192x64$(PY_EXT)
 fp16_tn: hk_fp16_tn_128x128x64$(PY_EXT) hk_fp16_tn_192x192x64$(PY_EXT)
