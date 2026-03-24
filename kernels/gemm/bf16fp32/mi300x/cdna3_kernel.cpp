@@ -30,7 +30,7 @@ struct micro_globals {
     _gl_C c;
     int M_dim, N_dim, K_dim;
     hipStream_t stream;
-    dim3 grid()  { return dim3((N_dim / BLOCK_SIZE) * (M_dim / BLOCK_SIZE)); }
+    dim3 grid()  { return dim3(ceil_div(N_dim, BLOCK_SIZE) * ceil_div(M_dim, BLOCK_SIZE)); }
     dim3 block() { return dim3(NUM_THREADS); }
     size_t dynamic_shared_memory() { return 65536; }
 };
@@ -71,7 +71,7 @@ void micro_tk(const micro_globals g) {
     const int warp_row = warp_id / 4;
     const int warp_col = warp_id % 4;
 
-    const int num_tiles = g.K_dim / K_STEP;
+    const int num_tiles = ceil_div(g.K_dim, K_STEP);
 
     // Load first tile into shared memory
     G::load(As, g.a, {0, 0, row, 0});
@@ -226,8 +226,49 @@ void micro_tk(const micro_globals g) {
         __builtin_amdgcn_s_barrier();
     }
 
-    store(g.c, C_accum[0], {0, 0, row * 4 + warp_row, col * 4 + warp_col});
-    store(g.c, C_accum[1], {0, 0, row * 4 + warp_row + 2, col * 4 + warp_col});
+    // Bounds-checked store: for boundary tiles, skip OOB elements.
+    // Interior tiles use the fast HK store; boundary tiles use scalar stores.
+    const int store_row0 = (row * 4 + warp_row) * REG_BLOCK;
+    const int store_row1 = (row * 4 + warp_row + 2) * REG_BLOCK;
+    const int store_col  = (col * 4 + warp_col) * REG_BLOCK;
+    const bool interior = (store_row1 + REG_BLOCK <= g.M_dim) && (store_col + REG_BLOCK <= g.N_dim);
+
+    if (interior) {
+        // Fast path: entire tile is within bounds
+        store(g.c, C_accum[0], {0, 0, row * 4 + warp_row, col * 4 + warp_col});
+        store(g.c, C_accum[1], {0, 0, row * 4 + warp_row + 2, col * 4 + warp_col});
+    } else {
+        // Slow path: boundary tile — write each element with bounds check
+        // MFMA 16x16 col_layout: lane L, element i → row = (L/16)*4+i, col = L%16
+        const int lane = threadIdx.x % 64;
+        const int lane_row_base = (lane / 16) * 4;
+        const int lane_col = lane % 16;
+        bf16* out = (bf16*)&g.c[{0, 0, 0, 0}];
+        const int N_stride = g.N_dim;
+
+        auto store_accum = [&](const auto& acc, int base_row, int base_col) {
+            constexpr int H = REG_BLOCK / 16;  // number of 16-row sub-tiles
+            constexpr int W = REG_BLOCK / 16;  // number of 16-col sub-tiles
+            #pragma unroll
+            for (int h = 0; h < H; h++) {
+                #pragma unroll
+                for (int w = 0; w < W; w++) {
+                    int c = base_col + w * 16 + lane_col;
+                    if (c >= g.N_dim) continue;
+                    const float* vals = (const float*)&acc.tiles[h][w].data[0];
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        int r = base_row + h * 16 + lane_row_base + i;
+                        if (r < g.M_dim) {
+                            out[r * N_stride + c] = __float2bfloat16(vals[i]);
+                        }
+                    }
+                }
+            }
+        };
+        store_accum(C_accum[0], store_row0, store_col);
+        store_accum(C_accum[1], store_row1, store_col);
+    }
 }
 
 void dispatch_micro(micro_globals g) {
@@ -246,7 +287,7 @@ void dispatch_torch(uint64_t a_ptr, uint64_t b_ptr, uint64_t c_ptr, int Msz, int
     micro_globals g{ga, gb, gc, Msz, Nsz, Ksz, (hipStream_t)0};
     unsigned long mem = 65536;
     hipFuncSetAttribute((void*)micro_tk, hipFuncAttributeMaxDynamicSharedMemorySize, mem);
-    micro_tk<<<dim3((Nsz/BLOCK_SIZE)*(Msz/BLOCK_SIZE)), dim3(NUM_THREADS), mem, (hipStream_t)0>>>(g);
+    micro_tk<<<dim3(ceil_div(Nsz,BLOCK_SIZE)*ceil_div(Msz,BLOCK_SIZE)), dim3(NUM_THREADS), mem, (hipStream_t)0>>>(g);
 }
 
 #ifndef HK_MODULE_NAME
