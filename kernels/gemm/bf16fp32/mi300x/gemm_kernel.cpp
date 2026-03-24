@@ -50,9 +50,9 @@ constexpr int MFMA_N = REG_N / 32;
 constexpr int a_f4pr = BK / 8;
 constexpr int b_f4pr = BK / 8;
 
-// Check double buffer fits in LDS
-static_assert((BM * BK + BN * BK) * 2 * sizeof(bf16) <= 65536,
-              "Double-buffered shared memory must fit in 64KB");
+// LDS size check — use double buffer if it fits, else single buffer
+constexpr bool USE_DOUBLE_BUF = (BM * BK + BN * BK) * 2 * sizeof(bf16) <= 65536;
+constexpr int NUM_BUFS = USE_DOUBLE_BUF ? 2 : 1;
 
 __global__ __launch_bounds__(NTHREADS, 2)
 void gemm_kernel(const bf16* __restrict__ A,
@@ -60,9 +60,9 @@ void gemm_kernel(const bf16* __restrict__ A,
                  bf16* __restrict__ C,
                  int M, int N, int K) {
 
-    // Double-buffered shared memory
-    __shared__ bf16 smem_A[2][BM * BK];
-    __shared__ bf16 smem_B[2][BN * BK];
+    // Shared memory (double-buffered if fits, else single)
+    __shared__ bf16 smem_A[NUM_BUFS][BM * BK];
+    __shared__ bf16 smem_B[NUM_BUFS][BN * BK];
 
     rt_fl<REG_M, REG_N, col_l, rt_c_s> C_accum;
     zero(C_accum);
@@ -156,7 +156,7 @@ void gemm_kernel(const bf16* __restrict__ A,
     asm volatile("s_waitcnt lgkmcnt(0)");
     __builtin_amdgcn_s_barrier();
 
-    // === MAIN LOOP: compute on tic, prefetch next to toc ===
+    // === MAIN LOOP ===
     #pragma unroll 1
     for (int kt = 0; kt < num_k - 1; ++kt) {
         // Issue buffer_load for next K-tile (async VMEM — overlaps with MFMA)
@@ -175,7 +175,7 @@ void gemm_kernel(const bf16* __restrict__ A,
             b_reg[i] = *reinterpret_cast<float4*>(&raw);
         }
 
-        // Compute all K_SLICES on tic buffer (MFMA overlaps with VMEM loads above)
+        // Compute all K_SLICES on tic buffer
         {
             const bf16* a_base = smem_A[tic] + a_warp_off;
             const bf16* b_base = smem_B[tic] + b_warp_off;
@@ -201,26 +201,32 @@ void gemm_kernel(const bf16* __restrict__ A,
             }
         }
 
-        // Wait for buffer_loads, write to shared[toc] via ds_write
+        // Wait for buffer_loads, write to shared
         asm volatile("s_waitcnt vmcnt(0)");
+        const int write_buf = USE_DOUBLE_BUF ? toc : tic;
+        if constexpr (!USE_DOUBLE_BUF) {
+            __builtin_amdgcn_s_barrier();  // barrier before overwriting shared
+        }
         #pragma unroll
         for (int i = 0; i < A_PER_T; ++i) {
             int idx = tid + i * NTHREADS;
-            uint32_t off = a_lds + toc * SMEM_TILE + idx * 16;
+            uint32_t off = a_lds + write_buf * SMEM_TILE + idx * 16;
             store_shared_vec(off, {a_reg[i].x, a_reg[i].y});
             store_shared_vec(off + 8, {a_reg[i].z, a_reg[i].w});
         }
         #pragma unroll
         for (int i = 0; i < B_PER_T; ++i) {
             int idx = tid + i * NTHREADS;
-            uint32_t off = b_lds + toc * SMEM_TILE + idx * 16;
+            uint32_t off = b_lds + write_buf * SMEM_TILE + idx * 16;
             store_shared_vec(off, {b_reg[i].x, b_reg[i].y});
             store_shared_vec(off + 8, {b_reg[i].z, b_reg[i].w});
         }
         asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_s_barrier();
-        tic ^= 1;
-        toc ^= 1;
+        if constexpr (USE_DOUBLE_BUF) {
+            tic ^= 1;
+            toc ^= 1;
+        }
     }
 
     // === LAST TILE: compute only ===
