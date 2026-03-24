@@ -31,8 +31,9 @@ using G = kittens::group<NUM_WARPS>;
 // Simple, bandwidth-optimal transpose using shared memory tile.
 // Each block transposes a 32×32 tile of half values.
 constexpr int TILE_DIM = 32;
+constexpr int BLOCK_ROWS = 8;
 
-__global__ __launch_bounds__(256)
+__global__ __launch_bounds__(TILE_DIM * BLOCK_ROWS)
 void transpose_kernel(
     half* __restrict__ dst,       // NxK output
     const half* __restrict__ src, // KxN input
@@ -45,7 +46,7 @@ void transpose_kernel(
 
     // Load from src (KxN) — coalesced along N
     #pragma unroll
-    for (int j = 0; j < TILE_DIM; j += 8) {
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
         if ((y + j) < K && x < N)
             tile[threadIdx.y + j][threadIdx.x] = src[(y + j) * N + x];
     }
@@ -55,7 +56,7 @@ void transpose_kernel(
     x = blockIdx.y * TILE_DIM + threadIdx.x;
     y = blockIdx.x * TILE_DIM + threadIdx.y;
     #pragma unroll
-    for (int j = 0; j < TILE_DIM; j += 8) {
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
         if ((y + j) < N && x < K)
             dst[(y + j) * K + x] = tile[threadIdx.x][threadIdx.y + j];
     }
@@ -254,7 +255,7 @@ PYBIND11_MODULE(HK_MODULE_NAME, m) {
             ws_b_size = need_b;
         }
 
-        dim3 trans_block(TILE_DIM, 8);
+        dim3 trans_block(TILE_DIM, BLOCK_ROWS);
 
         // Phase 1a: Transpose A from KxM to MxK
         dim3 grid_a((Msz + TILE_DIM - 1) / TILE_DIM, (Ksz + TILE_DIM - 1) / TILE_DIM);
