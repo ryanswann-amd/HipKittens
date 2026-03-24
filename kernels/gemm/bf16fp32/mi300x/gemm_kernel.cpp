@@ -72,10 +72,19 @@ void gemm_kernel(const bf16* __restrict__ A,
     int wgid = blockIdx.x;
     const int nb_m = M / BM, nb_n = N / BN;
     wgid = chiplet_transform_chunked(wgid, nb_m * nb_n, NUM_XCDS, WGM * WGM);
-    int nwig = WGM * nb_m, gid = wgid / nwig;
-    int first = gid * WGM, gsm = min(nb_m - first, WGM);
-    int pid_m = first + ((wgid % nwig) % gsm);
-    int pid_n = (wgid % nwig) / gsm;
+    // Swizzle: window along the LARGER grid dimension for correctness
+    int pid_m, pid_n;
+    if (nb_m >= nb_n) {
+        int nwig = WGM * nb_m, gid = wgid / nwig;
+        int first = gid * WGM, gsm = max(min(nb_m - first, WGM), 1);
+        pid_m = first + ((wgid % nwig) % gsm);
+        pid_n = (wgid % nwig) / gsm;
+    } else {
+        int nwig = WGM * nb_n, gid = wgid / nwig;
+        int first = gid * WGM, gsm = max(min(nb_n - first, WGM), 1);
+        pid_n = first + ((wgid % nwig) % gsm);
+        pid_m = (wgid % nwig) / gsm;
+    }
     const int row0 = pid_m * BM, col0 = pid_n * BN;
 
     const int tid = threadIdx.x;
@@ -121,7 +130,10 @@ void gemm_kernel(const bf16* __restrict__ A,
         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(smem_A[0])));
     uint32_t b_lds = __builtin_amdgcn_readfirstlane(
         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(smem_B[0])));
-    constexpr int SMEM_TILE = BM * BK * sizeof(bf16);  // bytes per A or B buffer
+    constexpr int SMEM_A_TILE = BM * BK * sizeof(bf16);  // bytes per A buffer
+    constexpr int SMEM_B_TILE = BN * BK * sizeof(bf16);  // bytes per B buffer
+    constexpr int A_F4_TOTAL = BM * a_f4pr;  // total float4 in one A tile
+    constexpr int B_F4_TOTAL = BN * b_f4pr;  // total float4 in one B tile
 
     // === PROLOGUE: Load first tile via buffer_load → register → shared ===
     {
@@ -141,16 +153,20 @@ void gemm_kernel(const bf16* __restrict__ A,
         #pragma unroll
         for (int i = 0; i < A_PER_T; ++i) {
             int idx = tid + i * NTHREADS;
-            uint32_t off = a_lds + tic * SMEM_TILE + idx * 16;
-            store_shared_vec(off, {a_reg[i].x, a_reg[i].y});
-            store_shared_vec(off + 8, {a_reg[i].z, a_reg[i].w});
+            if (idx < A_F4_TOTAL) {
+                uint32_t off = a_lds + tic * SMEM_A_TILE + idx * 16;
+                store_shared_vec(off, {a_reg[i].x, a_reg[i].y});
+                store_shared_vec(off + 8, {a_reg[i].z, a_reg[i].w});
+            }
         }
         #pragma unroll
         for (int i = 0; i < B_PER_T; ++i) {
             int idx = tid + i * NTHREADS;
-            uint32_t off = b_lds + tic * SMEM_TILE + idx * 16;
-            store_shared_vec(off, {b_reg[i].x, b_reg[i].y});
-            store_shared_vec(off + 8, {b_reg[i].z, b_reg[i].w});
+            if (idx < B_F4_TOTAL) {
+                uint32_t off = b_lds + tic * SMEM_B_TILE + idx * 16;
+                store_shared_vec(off, {b_reg[i].x, b_reg[i].y});
+                store_shared_vec(off + 8, {b_reg[i].z, b_reg[i].w});
+            }
         }
     }
     asm volatile("s_waitcnt lgkmcnt(0)");
@@ -223,16 +239,20 @@ void gemm_kernel(const bf16* __restrict__ A,
         #pragma unroll
         for (int i = 0; i < A_PER_T; ++i) {
             int idx = tid + i * NTHREADS;
-            uint32_t off = a_lds + write_buf * SMEM_TILE + idx * 16;
-            store_shared_vec(off, {a_reg[i].x, a_reg[i].y});
-            store_shared_vec(off + 8, {a_reg[i].z, a_reg[i].w});
+            if (idx < A_F4_TOTAL) {
+                uint32_t off = a_lds + write_buf * SMEM_A_TILE + idx * 16;
+                store_shared_vec(off, {a_reg[i].x, a_reg[i].y});
+                store_shared_vec(off + 8, {a_reg[i].z, a_reg[i].w});
+            }
         }
         #pragma unroll
         for (int i = 0; i < B_PER_T; ++i) {
             int idx = tid + i * NTHREADS;
-            uint32_t off = b_lds + write_buf * SMEM_TILE + idx * 16;
-            store_shared_vec(off, {b_reg[i].x, b_reg[i].y});
-            store_shared_vec(off + 8, {b_reg[i].z, b_reg[i].w});
+            if (idx < B_F4_TOTAL) {
+                uint32_t off = b_lds + write_buf * SMEM_B_TILE + idx * 16;
+                store_shared_vec(off, {b_reg[i].x, b_reg[i].y});
+                store_shared_vec(off + 8, {b_reg[i].z, b_reg[i].w});
+            }
         }
         asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_s_barrier();
