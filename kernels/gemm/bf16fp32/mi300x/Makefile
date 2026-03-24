@@ -258,7 +258,8 @@ fp16_tt: hk_fp16_tt_128x128x64$(PY_EXT) hk_fp16_tt_192x192x64$(PY_EXT)
 fp16_tn: hk_fp16_tn_128x128x64$(PY_EXT) hk_fp16_tn_192x192x64$(PY_EXT)
 
 # ===== Native FP32 kernels =====
-fp32_native: hk_fp32_native_nt_128$(PY_EXT) hk_fp32_native_nt_192$(PY_EXT) hk_fp32_native_nt_256$(PY_EXT)
+# FP32 native: only BS=128 works (BS=192/256 have row coverage gaps with T=16 MFMA)
+fp32_native: hk_fp32_native_nt_128$(PY_EXT)
 
 # FP32 fused transpose kernels (NN, TT, TN)
 FP32_FUSED_FLAGS = $(HIPFLAGS) -std=$(CXX_STD) -w -shared -fPIC \

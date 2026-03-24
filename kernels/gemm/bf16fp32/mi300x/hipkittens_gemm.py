@@ -66,9 +66,7 @@ _KERNELS = {
     ('fp16', 'tn', 256): 'hk_fp16_tn_fused_256x256x64',
     ('fp16', 'tn', 192): 'hk_fp16_tn_192x192x64',
     ('fp16', 'tn', 128): 'hk_fp16_tn_128x128x64',
-    # FP32 native NT
-    ('fp32', 'nt', 256): 'hk_fp32_native_nt_256',
-    ('fp32', 'nt', 192): 'hk_fp32_native_nt_192',
+    # FP32 native NT (only BS=128 — larger tiles have row coverage gaps with T=16 MFMA)
     ('fp32', 'nt', 128): 'hk_fp32_native_nt_128',
     # FP32 fused NN/TT/TN (transpose + NT)
     ('fp32', 'nn', 128): 'hk_fp32_nn_fused_128',
@@ -106,7 +104,7 @@ _TILE_PREF = {
     ('fp16', 'nn'): [256, 192, 128],
     ('fp16', 'tt'): [256, 192, 128],
     ('fp16', 'tn'): [256, 192, 128],
-    ('fp32', 'nt'): [256, 192, 128],
+    ('fp32', 'nt'): [128],
     ('fp32', 'nn'): [128],
     ('fp32', 'tt'): [128],
     ('fp32', 'tn'): [128],
