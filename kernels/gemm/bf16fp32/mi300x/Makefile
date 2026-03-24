@@ -141,3 +141,16 @@ hk_fp16_nt_128x128x64$(PY_EXT): fp16_nt_kernel.cpp
 		-o $@ 2>&1
 
 fp16_nt: hk_fp16_nt_256x256x64$(PY_EXT) hk_fp16_nt_128x128x64$(PY_EXT)
+
+# FP16 NN kernels — same transposed B load as BF16 NN
+hk_fp16_nn_128x128x64$(PY_EXT): fp16_nn_kernel.cpp
+	$(HIPCXX) $< $(FP16_FLAGS) \
+		-DBLOCK_SIZE_VAL=128 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_fp16_nn_128x128x64 \
+		-o $@ 2>&1
+
+hk_fp16_nn_192x192x64$(PY_EXT): fp16_nn_kernel.cpp
+	$(HIPCXX) $< $(FP16_FLAGS) \
+		-DBLOCK_SIZE_VAL=192 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_fp16_nn_192x192x64 \
+		-o $@ 2>&1
+
+fp16_nn: hk_fp16_nn_128x128x64$(PY_EXT) hk_fp16_nn_192x192x64$(PY_EXT)
