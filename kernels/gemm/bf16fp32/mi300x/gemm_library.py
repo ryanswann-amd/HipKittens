@@ -50,15 +50,22 @@ class GEMMLibrary:
                 self._kernels[name] = importlib.import_module(mod_name)
             except ImportError as e:
                 print(f"Warning: tile {name} ({mod_name}) not available: {e}")
-        # Load CDNA3 optimized kernels (multiple tile sizes)
+        # Load CDNA3 optimized kernels (3 validated tile sizes, all K_STEP=64)
         self._cdna3_kernels = {}
-        for name, mod_name in [('cdna3_128x128', 'hk_128x128'), ('cdna3_256x256', 'hk_256x256')]:
+        self._cdna3_tile_sizes = {}
+        for bs, mod_name in [(128, 'hk_128x128x64'), (192, 'hk_192x192x64'), (256, 'hk_256x256x64')]:
             try:
-                self._cdna3_kernels[name] = importlib.import_module(mod_name)
+                self._cdna3_kernels[bs] = importlib.import_module(mod_name)
+                self._cdna3_tile_sizes[bs] = 64  # K_STEP
             except ImportError:
-                pass
-        # Legacy single kernel alias
-        self._cdna3_kernel = self._cdna3_kernels.get('cdna3_256x256')
+                # Try without K_STEP suffix (legacy names)
+                try:
+                    legacy = f'hk_{bs}x{bs}'
+                    self._cdna3_kernels[bs] = importlib.import_module(legacy)
+                    self._cdna3_tile_sizes[bs] = 64
+                except ImportError:
+                    pass
+        self._cdna3_kernel = self._cdna3_kernels.get(256)
 
     def _build_origami_configs(self):
         """Build origami config_t objects for ranking."""
@@ -162,21 +169,41 @@ class GEMMLibrary:
         if C is None:
             C = torch.zeros(M, N, dtype=torch.bfloat16, device=A.device)
 
-        # Select best CDNA3 kernel based on problem size
-        # 128x128: best for M,N <= 2048 (higher occupancy)
-        # 256x256: best for M,N >= 4096 (more compute per tile)
-        cdna3_128 = self._cdna3_kernels.get('cdna3_128x128')
-        cdna3_256 = self._cdna3_kernels.get('cdna3_256x256')
+        # Use Origami to select the best CDNA3 tile
+        if K % 64 == 0 and self._cdna3_kernels:
+            # Find all compatible CDNA3 tiles
+            candidates = []
+            for bs, mod in self._cdna3_kernels.items():
+                if M % bs == 0 and N % bs == 0:
+                    candidates.append(bs)
+            
+            if candidates:
+                if len(candidates) == 1:
+                    self._cdna3_kernels[candidates[0]].dispatch(A, B, C)
+                else:
+                    # Use Origami to rank the candidates
+                    problem = self._make_problem(M, N, K)
+                    configs = []
+                    for bs in candidates:
+                        c = origami.config_t()
+                        c.mt = origami.dim3_t(bs, bs, 64)
+                        c.mi = origami.dim3_t(16, 16, 16)
+                        configs.append((bs, c))
+                    
+                    oc = [c for _, c in configs]
+                    result = origami.select_config(problem, self.hw, oc)
+                    best_bs = result.config.mt.m
+                    
+                    if best_bs in self._cdna3_kernels:
+                        self._cdna3_kernels[best_bs].dispatch(A, B, C)
+                    else:
+                        self._cdna3_kernels[candidates[0]].dispatch(A, B, C)
+                return C
         
-        if cdna3_256 and M >= 4096 and N >= 4096 and M % 256 == 0 and N % 256 == 0 and K % 64 == 0:
-            cdna3_256.dispatch(A, B, C)
-        elif cdna3_128 and M % 128 == 0 and N % 128 == 0 and K % 64 == 0:
-            cdna3_128.dispatch(A, B, C)
-        else:
-            # Fallback to C++ kernel with Origami selection
-            tile_name, _ = self.select_tile(M, N, K)
-            kernel = self._kernels[tile_name]
-            kernel.dispatch(A, B, C)
+        # Fallback to C++ kernel with Origami selection
+        tile_name, _ = self.select_tile(M, N, K)
+        kernel = self._kernels[tile_name]
+        kernel.dispatch(A, B, C)
         return C
 
     @property
