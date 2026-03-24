@@ -14,7 +14,10 @@ constexpr int NCOL = BS / (T * 4);
 constexpr int NACC = NROW * NCOL;
 static_assert(NROW * 2 * T == BS, "BS must be divisible by 2*T for row tiling");
 static_assert(NCOL * 4 * T == BS, "BS must be divisible by 4*T for col tiling");
+static_assert(KI == 2, "This kernel is optimized for KI=2 (KS=32, DK=16)");
 typedef __attribute__((__vector_size__(16*sizeof(float)))) float f16v;
+
+#define MFMA(acc, a, b) acc = __builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8(a, b, acc, 0, 0, 0)
 
 __global__ __launch_bounds__(NT, 2)
 void fp8_gemm_nt(float* __restrict__ C, const char* __restrict__ A,
@@ -40,7 +43,7 @@ void fp8_gemm_nt(float* __restrict__ C, const char* __restrict__ A,
     i32x4 a_sr=make_srsrc(Ab,BS*K,K), b_sr=make_srsrc(Bb,BS*K,K);
     const int total_loads = (BS * KS) / 16;
 
-    // Prologue: load first K tile
+    // Prologue
     for(int i=threadIdx.x; i<total_loads; i+=NT) {
         int r=i/(KS/16), c16=(i%(KS/16))*16;
         __uint128_t ra=llvm_amdgcn_raw_buffer_load_b128(a_sr,r*K+c16,0,0);
@@ -53,7 +56,7 @@ void fp8_gemm_nt(float* __restrict__ C, const char* __restrict__ A,
 
     const int num_tiles = K/KS;
     for(int kt=0; kt<num_tiles-1; kt++) {
-        // 1. Issue async global loads for NEXT tile → register buffer
+        // 1. Issue async global loads for NEXT tile
         float4 a_buf, b_buf;
         {
             int i = threadIdx.x;
@@ -65,28 +68,115 @@ void fp8_gemm_nt(float* __restrict__ C, const char* __restrict__ A,
             }
         }
 
-        // 2. Compute on current shared tile (overlapped with global loads in flight)
-        #pragma unroll
-        for(int ki=0; ki<KI; ki++) {
-            int koff=ki*DK+lk;
-            long av[NROW], bv[NCOL];
+        // 2. INTERLEAVED compute: ki=0 reads → ki=0 MFMAs with ki=1 reads → ki=1 MFMAs
+        {
+            int k0 = 0*DK + lk;
+            int k1 = 1*DK + lk;
+
+            // Phase A: Issue all ki=0 shared reads
+            long av0[NROW], bv0[NCOL];
             #pragma unroll
-            for(int r=0;r<NROW;r++) av[r]=*(const long*)&As[ar[r]][koff];
+            for(int r=0;r<NROW;r++) av0[r]=*(const long*)&As[ar[r]][k0];
             #pragma unroll
-            for(int c=0;c<NCOL;c++) bv[c]=*(const long*)&Bs[br[c]][koff];
+            for(int c=0;c<NCOL;c++) bv0[c]=*(const long*)&Bs[br[c]][k0];
+            __builtin_amdgcn_sched_barrier(0);
+
+            // Phase B: Wait for ki=0 reads, then ki=0 MFMAs interleaved with ki=1 reads
             asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_setprio(1);
-            #pragma unroll
-            for(int c=0;c<NCOL;c++) {
-                #pragma unroll
-                for(int r=0;r<NROW;r++) {
-                    acc[r*NCOL+c]=__builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8(av[r],bv[c],acc[r*NCOL+c],0,0,0);
+
+            // ki=0 col 0 MFMAs + start ki=1 A reads
+            MFMA(acc[0*NCOL+0], av0[0], bv0[0]);
+            long av1_0 = *(const long*)&As[ar[0]][k1];  // ki=1 read
+            if constexpr (NROW > 1) {
+                MFMA(acc[1*NCOL+0], av0[1], bv0[0]);
+                long av1_tmp = *(const long*)&As[ar[1]][k1];
+                if constexpr (NROW > 2) {
+                    MFMA(acc[2*NCOL+0], av0[2], bv0[0]);
+                    long av1_2 = *(const long*)&As[ar[2]][k1];
+                    if constexpr (NROW > 3) {
+                        MFMA(acc[3*NCOL+0], av0[3], bv0[0]);
+                        long av1_3 = *(const long*)&As[ar[3]][k1];
+                        // ki=0 col 1 MFMAs + ki=1 B reads
+                        if constexpr (NCOL > 1) {
+                            long bv1_0 = *(const long*)&Bs[br[0]][k1];
+                            MFMA(acc[0*NCOL+1], av0[0], bv0[1]);
+                            long bv1_1 = *(const long*)&Bs[br[1]][k1];
+                            MFMA(acc[1*NCOL+1], av0[1], bv0[1]);
+                            MFMA(acc[2*NCOL+1], av0[2], bv0[1]);
+                            MFMA(acc[3*NCOL+1], av0[3], bv0[1]);
+                            __builtin_amdgcn_s_setprio(0);
+                            __builtin_amdgcn_sched_barrier(0);
+
+                            // Phase C: ki=1 MFMAs (reads already in flight)
+                            asm volatile("s_waitcnt lgkmcnt(0)");
+                            __builtin_amdgcn_s_setprio(1);
+                            MFMA(acc[0*NCOL+0], av1_0, bv1_0);
+                            MFMA(acc[1*NCOL+0], av1_tmp, bv1_0);
+                            MFMA(acc[2*NCOL+0], av1_2, bv1_0);
+                            MFMA(acc[3*NCOL+0], av1_3, bv1_0);
+                            MFMA(acc[0*NCOL+1], av1_0, bv1_1);
+                            MFMA(acc[1*NCOL+1], av1_tmp, bv1_1);
+                            MFMA(acc[2*NCOL+1], av1_2, bv1_1);
+                            MFMA(acc[3*NCOL+1], av1_3, bv1_1);
+                        } else {
+                            __builtin_amdgcn_s_setprio(0);
+                            __builtin_amdgcn_sched_barrier(0);
+                            long bv1_0 = *(const long*)&Bs[br[0]][k1];
+                            asm volatile("s_waitcnt lgkmcnt(0)");
+                            __builtin_amdgcn_s_setprio(1);
+                            MFMA(acc[0*NCOL+0], av1_0, bv1_0);
+                            MFMA(acc[1*NCOL+0], av1_tmp, bv1_0);
+                            MFMA(acc[2*NCOL+0], av1_2, bv1_0);
+                            MFMA(acc[3*NCOL+0], av1_3, bv1_0);
+                        }
+                    } else {
+                        // NROW==3 path (not used currently)
+                        __builtin_amdgcn_s_setprio(0);
+                        long bv1_0 = *(const long*)&Bs[br[0]][k1];
+                        asm volatile("s_waitcnt lgkmcnt(0)");
+                        __builtin_amdgcn_s_setprio(1);
+                        MFMA(acc[0], av1_0, bv1_0);
+                        MFMA(acc[1], av1_tmp, bv1_0);
+                        MFMA(acc[2], av1_2, bv1_0);
+                    }
+                } else {
+                    // NROW==2 path (BS=128)
+                    if constexpr (NCOL > 1) {
+                        long bv1_0 = *(const long*)&Bs[br[0]][k1];
+                        MFMA(acc[0*NCOL+1], av0[0], bv0[1]);
+                        long bv1_1 = *(const long*)&Bs[br[1]][k1];
+                        MFMA(acc[1*NCOL+1], av0[1], bv0[1]);
+                        __builtin_amdgcn_s_setprio(0);
+                        __builtin_amdgcn_sched_barrier(0);
+                        asm volatile("s_waitcnt lgkmcnt(0)");
+                        __builtin_amdgcn_s_setprio(1);
+                        MFMA(acc[0*NCOL+0], av1_0, bv1_0);
+                        MFMA(acc[1*NCOL+0], av1_tmp, bv1_0);
+                        MFMA(acc[0*NCOL+1], av1_0, bv1_1);
+                        MFMA(acc[1*NCOL+1], av1_tmp, bv1_1);
+                    } else {
+                        // NROW==2, NCOL==1 (BS=128, simplest case)
+                        __builtin_amdgcn_s_setprio(0);
+                        __builtin_amdgcn_sched_barrier(0);
+                        long bv1_0 = *(const long*)&Bs[br[0]][k1];
+                        asm volatile("s_waitcnt lgkmcnt(0)");
+                        __builtin_amdgcn_s_setprio(1);
+                        MFMA(acc[0], av1_0, bv1_0);
+                        MFMA(acc[1], av1_tmp, bv1_0);
+                    }
                 }
+            } else {
+                // NROW==1 (BS=64, not used)
+                __builtin_amdgcn_s_setprio(0);
+                long bv1_0 = *(const long*)&Bs[br[0]][k1];
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                MFMA(acc[0], av1_0, bv1_0);
             }
             __builtin_amdgcn_s_setprio(0);
         }
 
-        // 3. Wait for loads, store to shared, barrier
+        // 3. Wait for globals, store to shared, barrier
         asm volatile("s_waitcnt vmcnt(0)");
         __builtin_amdgcn_s_barrier();
         {
@@ -101,22 +191,45 @@ void fp8_gemm_nt(float* __restrict__ C, const char* __restrict__ A,
         __builtin_amdgcn_s_barrier();
     }
 
-    // Last tile: compute only (no prefetch needed)
-    #pragma unroll
-    for(int ki=0; ki<KI; ki++) {
-        int koff=ki*DK+lk;
-        long av[NROW], bv[NCOL];
+    // Last tile: same interleaved pattern but no prefetch
+    {
+        int k0 = 0*DK + lk;
+        int k1 = 1*DK + lk;
+
+        long av0[NROW], bv0[NCOL];
         #pragma unroll
-        for(int r=0;r<NROW;r++) av[r]=*(const long*)&As[ar[r]][koff];
+        for(int r=0;r<NROW;r++) av0[r]=*(const long*)&As[ar[r]][k0];
         #pragma unroll
-        for(int c=0;c<NCOL;c++) bv[c]=*(const long*)&Bs[br[c]][koff];
+        for(int c=0;c<NCOL;c++) bv0[c]=*(const long*)&Bs[br[c]][k0];
+        __builtin_amdgcn_sched_barrier(0);
+
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+
+        // Same interleaved MFMA pattern
+        #pragma unroll
+        for(int c=0;c<NCOL;c++) {
+            #pragma unroll
+            for(int r=0;r<NROW;r++) {
+                MFMA(acc[r*NCOL+c], av0[r], bv0[c]);
+            }
+        }
+        __builtin_amdgcn_s_setprio(0);
+        __builtin_amdgcn_sched_barrier(0);
+
+        long av1[NROW], bv1[NCOL];
+        #pragma unroll
+        for(int r=0;r<NROW;r++) av1[r]=*(const long*)&As[ar[r]][k1];
+        #pragma unroll
+        for(int c=0;c<NCOL;c++) bv1[c]=*(const long*)&Bs[br[c]][k1];
+
         asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_s_setprio(1);
         #pragma unroll
         for(int c=0;c<NCOL;c++) {
             #pragma unroll
             for(int r=0;r<NROW;r++) {
-                acc[r*NCOL+c]=__builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8(av[r],bv[c],acc[r*NCOL+c],0,0,0);
+                MFMA(acc[r*NCOL+c], av1[r], bv1[c]);
             }
         }
         __builtin_amdgcn_s_setprio(0);
@@ -141,6 +254,8 @@ void fp8_gemm_nt(float* __restrict__ C, const char* __restrict__ A,
         }
     }
 }
+
+#undef MFMA
 
 #ifndef HK_MODULE_NAME
 #define HK_MODULE_NAME hk_fp8_native_nt
