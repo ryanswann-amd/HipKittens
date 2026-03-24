@@ -66,6 +66,8 @@ void micro_tk(const micro_globals g) {
     const int row = pid_m;
     const int col = pid_n;
 
+    // Early exit for workgroups beyond the matrix (from ceil_div grid)
+    if (row >= num_pid_m || col >= num_pid_n) return;
 
     const int warp_id = kittens::warpid();
     const int warp_row = warp_id / 4;
@@ -280,11 +282,51 @@ void dispatch_micro(micro_globals g) {
 
 
 void dispatch_torch(uint64_t a_ptr, uint64_t b_ptr, uint64_t c_ptr, int Msz, int Nsz, int Ksz) {
-    auto ga = kittens::make_gl<_gl_A>(a_ptr, 1, 1, Msz, Ksz);
-    auto gb = kittens::make_gl<_gl_B>(b_ptr, 1, 1, Nsz, Ksz);
+    // For aligned shapes: direct dispatch (zero overhead)
+    // For non-aligned: pad with static workspace, copy data + zero padding rows only
+    int padM = ((Msz + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+    int padN = ((Nsz + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+    bool need_pad_m = (padM != Msz);
+    bool need_pad_n = (padN != Nsz);
+    // K is always 64-aligned for our shapes (multiples of 128), but handle edge case
+    int Kuse = Ksz;
+
+    uint64_t a_use = a_ptr, b_use = b_ptr;
+
+    if (need_pad_m || need_pad_n) {
+        static bf16 *ws_a = nullptr, *ws_b = nullptr;
+        static size_t ws_a_sz = 0, ws_b_sz = 0;
+
+        if (need_pad_m) {
+            size_t need = (size_t)padM * Kuse * sizeof(bf16);
+            if (need > ws_a_sz) { if (ws_a) hipFree(ws_a); hipMalloc(&ws_a, need); ws_a_sz = need; }
+            // Copy original rows (contiguous since stride = Kuse for both)
+            hipMemcpyAsync(ws_a, (void*)a_ptr, (size_t)Msz * Kuse * sizeof(bf16),
+                          hipMemcpyDeviceToDevice, (hipStream_t)0);
+            // Zero only the padding rows (not the whole buffer)
+            if (padM > Msz)
+                hipMemsetAsync(ws_a + (size_t)Msz * Kuse, 0,
+                              (size_t)(padM - Msz) * Kuse * sizeof(bf16), (hipStream_t)0);
+            a_use = (uint64_t)ws_a;
+        }
+
+        if (need_pad_n) {
+            size_t need = (size_t)padN * Kuse * sizeof(bf16);
+            if (need > ws_b_sz) { if (ws_b) hipFree(ws_b); hipMalloc(&ws_b, need); ws_b_sz = need; }
+            hipMemcpyAsync(ws_b, (void*)b_ptr, (size_t)Nsz * Kuse * sizeof(bf16),
+                          hipMemcpyDeviceToDevice, (hipStream_t)0);
+            if (padN > Nsz)
+                hipMemsetAsync(ws_b + (size_t)Nsz * Kuse, 0,
+                              (size_t)(padN - Nsz) * Kuse * sizeof(bf16), (hipStream_t)0);
+            b_use = (uint64_t)ws_b;
+        }
+    }
+
+    auto ga = kittens::make_gl<_gl_A>(a_use, 1, 1, padM, Kuse);
+    auto gb = kittens::make_gl<_gl_B>(b_use, 1, 1, padN, Kuse);
     auto gc = kittens::make_gl<_gl_C>(c_ptr, 1, 1, Msz, Nsz);
 
-    micro_globals g{ga, gb, gc, Msz, Nsz, Ksz, (hipStream_t)0};
+    micro_globals g{ga, gb, gc, Msz, Nsz, Kuse, (hipStream_t)0};
     unsigned long mem = 65536;
     hipFuncSetAttribute((void*)micro_tk, hipFuncAttributeMaxDynamicSharedMemorySize, mem);
     micro_tk<<<dim3(ceil_div(Nsz,BLOCK_SIZE)*ceil_div(Msz,BLOCK_SIZE)), dim3(NUM_THREADS), mem, (hipStream_t)0>>>(g);
