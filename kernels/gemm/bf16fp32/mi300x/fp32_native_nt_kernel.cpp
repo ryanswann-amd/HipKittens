@@ -110,7 +110,11 @@ void fp32_gemm_nt(float* __restrict__ C, const float* __restrict__ A,
         for(int k=0;k<4;k++) { C[(tm*BS+wr*RB+bi*T+mk*4+k)*N+col]=c0[bi][bj][k]; C[(tm*BS+(wr+2)*RB+bi*T+mk*4+k)*N+col]=c1[bi][bj][k]; } }
 }
 
-PYBIND11_MODULE(hk_fp32_native_nt, m) {
+
+#ifndef HK_MODULE_NAME
+#define HK_MODULE_NAME hk_fp32_native_nt
+#endif
+PYBIND11_MODULE(HK_MODULE_NAME, m) {
     m.def("dispatch", [](pybind11::object A, pybind11::object B, pybind11::object C) {
         auto sa=A.attr("shape").cast<pybind11::tuple>(); auto sb=B.attr("shape").cast<pybind11::tuple>();
         int M=sa[0].cast<int>(), K=sa[1].cast<int>(), N=sb[0].cast<int>();

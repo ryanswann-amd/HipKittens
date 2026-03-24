@@ -1,5 +1,8 @@
 #ifndef BLOCK_SIZE_VAL
 #define BLOCK_SIZE_VAL 128
+#ifndef K_STEP_VAL
+#define K_STEP_VAL 32
+#endif
 #endif
 // Native FP8 NT GEMM — optimized with buffer_load + sched_group_barrier
 // v_mfma_f32_32x32x16_fp8_fp8: 32768 FLOPs per instruction, K=16
@@ -9,7 +12,7 @@
 #include <pybind11/pybind11.h>
 using namespace kittens;
 
-constexpr int BS=BLOCK_SIZE_VAL, KS=32, NW=8, WS=64, NT=NW*WS;
+constexpr int BS=BLOCK_SIZE_VAL, KS=K_STEP_VAL, NW=8, WS=64, NT=NW*WS;
 constexpr int T=32, DK=16, RB=T, KI=KS/DK;  // KI=2
 
 __device__ inline void mfma_fp8(float (&D)[16], long A, long B, const float (&C)[16]) {
@@ -97,7 +100,11 @@ void fp8_gemm_nt(float* __restrict__ C, const char* __restrict__ A,
     }
 }
 
-PYBIND11_MODULE(hk_fp8_native_nt, m) {
+
+#ifndef HK_MODULE_NAME
+#define HK_MODULE_NAME hk_fp8_native_nt
+#endif
+PYBIND11_MODULE(HK_MODULE_NAME, m) {
     m.def("dispatch", [](pybind11::object A, pybind11::object B, pybind11::object C) {
         auto sa=A.attr("shape").cast<pybind11::tuple>(); auto sb=B.attr("shape").cast<pybind11::tuple>();
         int M=sa[0].cast<int>(), K=sa[1].cast<int>(), N=sb[0].cast<int>();
