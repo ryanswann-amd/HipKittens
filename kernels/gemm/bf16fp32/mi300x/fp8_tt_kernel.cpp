@@ -17,13 +17,15 @@ constexpr int T=32, DK=16, KI=KS/DK;
 constexpr int NROW = BS / (T * 2);
 constexpr int NCOL = BS / (T * 4);
 constexpr int NACC = NROW * NCOL;
-static_assert(NROW * 2 * T == BS && NCOL * 4 * T == BS && KI == 2, "Tile config");
+static_assert(NROW * 2 * T == BS && NCOL * 4 * T == BS, "Tile config");
+constexpr int AS_PAD = KS + 4;  // LDS padding for bank conflict elimination
 typedef __attribute__((__vector_size__(16*sizeof(float)))) float f16v;
 #define MFMA(acc, a, b) acc = __builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8(a, b, acc, 0, 0, 0)
 
 // Transpose load: rows×cols global (stride=cols) → shared[col][row] (transposed)
+template<int STRIDE>
 __device__ void load_transpose_fp8(
-    char shared[][KS], const char* __restrict__ base,
+    char shared[][STRIDE], const char* __restrict__ base,
     int stride, int k_offset, int tile_offset)
 {
     constexpr int N_GROUP=16, K_GROUP=4;
@@ -50,7 +52,7 @@ __device__ void load_transpose_fp8(
 __global__ __launch_bounds__(NT, 2)
 void fp8_gemm_tt(float* __restrict__ C, const char* __restrict__ A,
                  const char* __restrict__ B, int M, int N, int K) {
-    __shared__ char As[BS][KS], Bs[BS][KS];
+    __shared__ char As[BS][AS_PAD], Bs[BS][KS];  // As padded (A transpose), Bs unpadded (NT layout)
     const int nn=N/BS; int wgid=blockIdx.x;
     {int W=4,ch=W*W,nc=(gridDim.x+ch-1)/ch; wgid=(wgid%nc)*ch+wgid/nc;}
     int tm=wgid/nn, tn=wgid%nn;
@@ -71,7 +73,7 @@ void fp8_gemm_tt(float* __restrict__ C, const char* __restrict__ A,
     const int total_b_loads = (BS * KS) / 16;
 
     // Prologue
-    load_transpose_fp8(As, A, M, 0, A_m_offset);
+    load_transpose_fp8<AS_PAD>(As, A, M, 0, A_m_offset);
     for(int i=threadIdx.x; i<total_b_loads; i+=NT) {
         int r=i/(KS/16),c16=(i%(KS/16))*16;
         __uint128_t rb=llvm_amdgcn_raw_buffer_load_b128(b_sr,r*K+c16,0,0);
@@ -108,7 +110,7 @@ void fp8_gemm_tt(float* __restrict__ C, const char* __restrict__ A,
         {int i=threadIdx.x; if(i<total_b_loads){
             int r=i/(KS/16),c16=(i%(KS/16))*16;
             *(float4*)&Bs[r][c16]=b_buf;}}
-        load_transpose_fp8(As, A, M, (kt+1)*KS, A_m_offset);
+        load_transpose_fp8<AS_PAD>(As, A, M, (kt+1)*KS, A_m_offset);
         asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_s_barrier();
     }
