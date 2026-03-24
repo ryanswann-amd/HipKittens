@@ -10,9 +10,6 @@ constexpr int DOT_SLICE        = 16;
 #define NUM_WARPS 8
 #define NUM_THREADS (kittens::WARP_THREADS * NUM_WARPS)
 
-#define M 8192
-#define K 8192
-#define N 8192
 
 using _gl_A = gl<bf16, -1, -1, -1, -1>;
 using _gl_B = gl<bf16, -1, -1, -1, -1>;
@@ -25,8 +22,9 @@ struct micro_globals {
     _gl_A a;
     _gl_B b;
     _gl_C c;
+    int M_dim, N_dim, K_dim;
     hipStream_t stream;
-    dim3 grid()  { return dim3((N / BLOCK_SIZE) * (M / BLOCK_SIZE)); }
+    dim3 grid()  { return dim3((N_dim / BLOCK_SIZE) * (M_dim / BLOCK_SIZE)); }
     dim3 block() { return dim3(NUM_THREADS); }
     size_t dynamic_shared_memory() { return 65536; }
 };
@@ -50,8 +48,8 @@ void micro_tk(const micro_globals g) {
     wgid = chiplet_transform_chunked(wgid, NUM_WGS, NUM_XCDS, WGM*WGM);
     // Swizzle for better L2 within the same XCD. Use separate M/N tiling sizes
     // so rectangular grids don't generate out-of-bounds columns.
-    const int num_pid_m = ceil_div(M, BLOCK_SIZE);
-    const int num_pid_n = ceil_div(N, BLOCK_SIZE);
+    const int num_pid_m = ceil_div(g.M_dim, BLOCK_SIZE);
+    const int num_pid_n = ceil_div(g.N_dim, BLOCK_SIZE);
     int num_wgid_in_group = WGM * num_pid_n;
     int group_id = wgid / num_wgid_in_group;
     int first_pid_m = group_id * WGM;
@@ -67,7 +65,7 @@ void micro_tk(const micro_globals g) {
     const int warp_row = warp_id / 4;
     const int warp_col = warp_id % 4;
 
-    const int num_tiles = K / K_STEP;
+    const int num_tiles = g.K_dim / K_STEP;
 
     // Load first tile into shared memory
     G::load(As, g.a, {0, 0, row, 0});
@@ -234,21 +232,25 @@ void dispatch_micro(micro_globals g) {
 
 
 
-void dispatch_torch(uint64_t a_ptr, uint64_t b_ptr, uint64_t c_ptr) {
-    auto ga = kittens::make_gl<_gl_A>(a_ptr, 1, 1, M, K);
-    auto gb = kittens::make_gl<_gl_B>(b_ptr, 1, 1, N, K);
-    auto gc = kittens::make_gl<_gl_C>(c_ptr, 1, 1, M, N);
-    micro_globals g{ga, gb, gc, (hipStream_t)0};
+void dispatch_torch(uint64_t a_ptr, uint64_t b_ptr, uint64_t c_ptr, int Msz, int Nsz, int Ksz) {
+    auto ga = kittens::make_gl<_gl_A>(a_ptr, 1, 1, Msz, Ksz);
+    auto gb = kittens::make_gl<_gl_B>(b_ptr, 1, 1, Nsz, Ksz);
+    auto gc = kittens::make_gl<_gl_C>(c_ptr, 1, 1, Msz, Nsz);
+
+    micro_globals g{ga, gb, gc, Msz, Nsz, Ksz, (hipStream_t)0};
     unsigned long mem = 65536;
     hipFuncSetAttribute((void*)micro_tk, hipFuncAttributeMaxDynamicSharedMemorySize, mem);
-    micro_tk<<<dim3((N/BLOCK_SIZE)*(M/BLOCK_SIZE)), dim3(NUM_THREADS), mem, (hipStream_t)0>>>(g);
+    micro_tk<<<dim3((Nsz/BLOCK_SIZE)*(Msz/BLOCK_SIZE)), dim3(NUM_THREADS), mem, (hipStream_t)0>>>(g);
 }
 
 PYBIND11_MODULE(hk_gemm, m) {
     m.def("dispatch", [](pybind11::object A, pybind11::object B, pybind11::object C) {
+        auto sa = A.attr("shape").cast<pybind11::tuple>();
+        auto sb = B.attr("shape").cast<pybind11::tuple>();
         dispatch_torch(
             A.attr("data_ptr")().cast<uint64_t>(),
             B.attr("data_ptr")().cast<uint64_t>(),
-            C.attr("data_ptr")().cast<uint64_t>());
+            C.attr("data_ptr")().cast<uint64_t>(),
+            sa[0].cast<int>(), sb[0].cast<int>(), sa[1].cast<int>());
     });
 }
