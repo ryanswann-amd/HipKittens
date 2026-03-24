@@ -260,6 +260,29 @@ fp16_tn: hk_fp16_tn_128x128x64$(PY_EXT) hk_fp16_tn_192x192x64$(PY_EXT)
 # ===== Native FP32 kernels =====
 fp32_native: hk_fp32_native_nt_128$(PY_EXT) hk_fp32_native_nt_192$(PY_EXT) hk_fp32_native_nt_256$(PY_EXT)
 
+# FP32 fused transpose kernels (NN, TT, TN)
+FP32_FUSED_FLAGS = $(HIPFLAGS) -std=$(CXX_STD) -w -shared -fPIC \
+	-I$(CDNA3_HEADERS)/include -I$(CDNA3_HEADERS)/prototype \
+	-I$(ROCM_INCLUDE_DIR) -I$(HIP_INCLUDE_DIR) \
+	$(PY_INCLUDES) $(PY_LDFLAGS)
+
+hk_fp32_nn_fused_%$(PY_EXT): fp32_nn_fused_kernel.cpp
+	$(HIPCXX) $< $(FP32_FUSED_FLAGS) \
+		-DBLOCK_SIZE_VAL=$(firstword $(subst x, ,$*)) -DHK_MODULE_NAME=hk_fp32_nn_fused_$* \
+		-o $@ 2>&1
+
+hk_fp32_tt_fused_%$(PY_EXT): fp32_tt_fused_kernel.cpp
+	$(HIPCXX) $< $(FP32_FUSED_FLAGS) \
+		-DBLOCK_SIZE_VAL=$(firstword $(subst x, ,$*)) -DHK_MODULE_NAME=hk_fp32_tt_fused_$* \
+		-o $@ 2>&1
+
+hk_fp32_tn_fused_%$(PY_EXT): fp32_tn_fused_kernel.cpp
+	$(HIPCXX) $< $(FP32_FUSED_FLAGS) \
+		-DBLOCK_SIZE_VAL=$(firstword $(subst x, ,$*)) -DHK_MODULE_NAME=hk_fp32_tn_fused_$* \
+		-o $@ 2>&1
+
+fp32_fused: hk_fp32_nn_fused_128$(PY_EXT) hk_fp32_tt_fused_128$(PY_EXT) hk_fp32_tn_fused_128$(PY_EXT)
+
 hk_fp32_native_nt_%$(PY_EXT): fp32_native_nt_kernel.cpp
 	$(HIPCXX) $< $(HIPFLAGS) -std=$(CXX_STD) -w -shared -fPIC \
 		-I$(CDNA3_HEADERS)/include -I$(CDNA3_HEADERS)/prototype \

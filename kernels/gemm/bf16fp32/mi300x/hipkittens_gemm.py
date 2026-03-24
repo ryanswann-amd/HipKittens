@@ -70,6 +70,10 @@ _KERNELS = {
     ('fp32', 'nt', 256): 'hk_fp32_native_nt_256',
     ('fp32', 'nt', 192): 'hk_fp32_native_nt_192',
     ('fp32', 'nt', 128): 'hk_fp32_native_nt_128',
+    # FP32 fused NN/TT/TN (transpose + NT)
+    ('fp32', 'nn', 128): 'hk_fp32_nn_fused_128',
+    ('fp32', 'tt', 128): 'hk_fp32_tt_fused_128',
+    ('fp32', 'tn', 128): 'hk_fp32_tn_fused_128',
     # FP8 native NT (32x32 MFMA — only 128 and 256 divide cleanly)
     ('fp8_e4m3', 'nt', 256): 'hk_fp8_native_nt_256',
     ('fp8_e4m3', 'nt', 128): 'hk_fp8_native_nt_128',
@@ -103,6 +107,9 @@ _TILE_PREF = {
     ('fp16', 'tt'): [256, 192, 128],
     ('fp16', 'tn'): [256, 192, 128],
     ('fp32', 'nt'): [256, 192, 128],
+    ('fp32', 'nn'): [128],
+    ('fp32', 'tt'): [128],
+    ('fp32', 'tn'): [128],
     ('fp8_e4m3', 'nt'): [256, 128],
     ('fp8_e4m3', 'nn'): [256, 128],
     ('fp8_e4m3', 'tt'): [256, 128],
