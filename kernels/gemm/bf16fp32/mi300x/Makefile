@@ -98,3 +98,27 @@ hk_256x256$(PY_EXT): cdna3_kernel.cpp
 		$(PY_INCLUDES) $(PY_LDFLAGS) \
 		-DBLOCK_SIZE_VAL=256 -DHK_MODULE_NAME=hk_256x256 \
 		-o $@ 2>&1
+
+# CDNA3 NN (non-transposed) kernels — C = A @ B where B is KxN
+CDNA3_NN_FLAGS = $(HIPFLAGS) -std=$(CXX_STD) -w -shared -fPIC \
+	-I$(CDNA3_HEADERS)/include -I$(CDNA3_HEADERS)/prototype \
+	-I$(ROCM_INCLUDE_DIR) -I$(HIP_INCLUDE_DIR) \
+	$(PY_INCLUDES) $(PY_LDFLAGS) \
+	-Rpass-analysis=kernel-resource-usage
+
+hk_nn_256x256x64$(PY_EXT): nn_kernel.cpp
+	$(HIPCXX) $< $(CDNA3_NN_FLAGS) \
+		-DBLOCK_SIZE_VAL=256 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_nn_256x256x64 \
+		-o $@ 2>&1
+
+hk_nn_128x128x64$(PY_EXT): nn_kernel.cpp
+	$(HIPCXX) $< $(CDNA3_NN_FLAGS) \
+		-DBLOCK_SIZE_VAL=128 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_nn_128x128x64 \
+		-o $@ 2>&1
+
+hk_nn_192x192x64$(PY_EXT): nn_kernel.cpp
+	$(HIPCXX) $< $(CDNA3_NN_FLAGS) \
+		-DBLOCK_SIZE_VAL=192 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_nn_192x192x64 \
+		-o $@ 2>&1
+
+nn: hk_nn_256x256x64$(PY_EXT) hk_nn_128x128x64$(PY_EXT) hk_nn_192x192x64$(PY_EXT)
