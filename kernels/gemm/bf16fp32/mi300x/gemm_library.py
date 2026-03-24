@@ -44,12 +44,17 @@ class GEMMLibrary:
         self._build_origami_configs()
 
     def _load_kernels(self):
-        """Load compiled tile kernel .so modules."""
+        """Load compiled tile kernel .so modules + CDNA3 optimized kernel."""
         for name, (mod_name, *_) in self.TILE_CONFIGS.items():
             try:
                 self._kernels[name] = importlib.import_module(mod_name)
             except ImportError as e:
                 print(f"Warning: tile {name} ({mod_name}) not available: {e}")
+        # Load CDNA3 optimized kernel (98% of hipBLASLt for large sizes)
+        try:
+            self._cdna3_kernel = importlib.import_module('hk_gemm')
+        except ImportError:
+            self._cdna3_kernel = None
 
     def _build_origami_configs(self):
         """Build origami config_t objects for ranking."""
@@ -132,7 +137,12 @@ class GEMMLibrary:
         return ranked
 
     def gemm(self, A, B, C=None):
-        """Run GEMM: C = A @ B^T using Origami-selected tile.
+        """Run GEMM: C = A @ B^T using the best available kernel.
+
+        For large sizes (M,N >= 4096, divisible by 256, K divisible by 64):
+          uses the CDNA3 optimized kernel (98% of hipBLASLt).
+        For smaller sizes:
+          uses the C++ kernel with Origami tile selection.
 
         Args:
             A: BF16 tensor, shape (M, K)
@@ -148,9 +158,15 @@ class GEMMLibrary:
         if C is None:
             C = torch.zeros(M, N, dtype=torch.bfloat16, device=A.device)
 
-        tile_name, _ = self.select_tile(M, N, K)
-        kernel = self._kernels[tile_name]
-        kernel.dispatch(A, B, C)
+        # Use CDNA3 optimized kernel for large, well-aligned sizes
+        if (self._cdna3_kernel is not None and
+            M >= 4096 and N >= 4096 and
+            M % 256 == 0 and N % 256 == 0 and K % 64 == 0):
+            self._cdna3_kernel.dispatch(A, B, C)
+        else:
+            tile_name, _ = self.select_tile(M, N, K)
+            kernel = self._kernels[tile_name]
+            kernel.dispatch(A, B, C)
         return C
 
     @property

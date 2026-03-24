@@ -71,3 +71,13 @@ clean:
 	rm -f *.so *.hip *.o
 
 .PHONY: all clean
+
+# CDNA3 branch optimized kernel (uses cdna3 branch headers)
+CDNA3_HEADERS = /tmp/hk_cdna3
+hk_gemm$(PY_EXT): cdna3_kernel.cpp
+	$(HIPCXX) $< $(HIPFLAGS) -std=$(CXX_STD) -w -shared -fPIC \
+		-I$(CDNA3_HEADERS)/include -I$(CDNA3_HEADERS)/prototype \
+		-I$(ROCM_INCLUDE_DIR) -I$(HIP_INCLUDE_DIR) \
+		$(PY_INCLUDES) $(PY_LDFLAGS) \
+		-Rpass-analysis=kernel-resource-usage \
+		-o $@ 2>&1
