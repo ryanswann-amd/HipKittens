@@ -122,3 +122,22 @@ hk_nn_192x192x64$(PY_EXT): nn_kernel.cpp
 		-o $@ 2>&1
 
 nn: hk_nn_256x256x64$(PY_EXT) hk_nn_128x128x64$(PY_EXT) hk_nn_192x192x64$(PY_EXT)
+
+# FP16 NT kernels — same structure as BF16 NT but with half type
+FP16_FLAGS = $(HIPFLAGS) -std=$(CXX_STD) -w -shared -fPIC \
+	-I$(CDNA3_HEADERS)/include -I$(CDNA3_HEADERS)/prototype \
+	-I$(ROCM_INCLUDE_DIR) -I$(HIP_INCLUDE_DIR) \
+	$(PY_INCLUDES) $(PY_LDFLAGS) \
+	-Rpass-analysis=kernel-resource-usage
+
+hk_fp16_nt_256x256x64$(PY_EXT): fp16_nt_kernel.cpp
+	$(HIPCXX) $< $(FP16_FLAGS) \
+		-DBLOCK_SIZE_VAL=256 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_fp16_nt_256x256x64 \
+		-o $@ 2>&1
+
+hk_fp16_nt_128x128x64$(PY_EXT): fp16_nt_kernel.cpp
+	$(HIPCXX) $< $(FP16_FLAGS) \
+		-DBLOCK_SIZE_VAL=128 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_fp16_nt_128x128x64 \
+		-o $@ 2>&1
+
+fp16_nt: hk_fp16_nt_256x256x64$(PY_EXT) hk_fp16_nt_128x128x64$(PY_EXT)
