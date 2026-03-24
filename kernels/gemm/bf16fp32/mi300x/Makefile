@@ -327,3 +327,23 @@ hk_fp8_tn_fused_%$(PY_EXT): fp8_tn_fused_kernel.cpp
 fp8_fused: hk_fp8_nn_fused_256x256x64$(PY_EXT) hk_fp8_nn_fused_128x128x64$(PY_EXT) \
            hk_fp8_tt_fused_256x256x64$(PY_EXT) hk_fp8_tt_fused_128x128x64$(PY_EXT) \
            hk_fp8_tn_fused_256x256x64$(PY_EXT) hk_fp8_tn_fused_128x128x64$(PY_EXT)
+
+# FP8 in-kernel transpose kernels (preferred over fused — no workspace, same or better perf)
+hk_fp8_nn_%$(PY_EXT): fp8_nn_kernel.cpp
+	$(HIPCXX) $< $(FP8_FUSED_FLAGS) \
+		-DBLOCK_SIZE_VAL=$(firstword $(subst _, ,$*)) -DHK_MODULE_NAME=hk_fp8_nn_$* \
+		-o $@ 2>&1
+
+hk_fp8_tt_%$(PY_EXT): fp8_tt_kernel.cpp
+	$(HIPCXX) $< $(FP8_FUSED_FLAGS) \
+		-DBLOCK_SIZE_VAL=$(firstword $(subst _, ,$*)) -DHK_MODULE_NAME=hk_fp8_tt_$* \
+		-o $@ 2>&1
+
+hk_fp8_tn_%$(PY_EXT): fp8_tn_kernel.cpp
+	$(HIPCXX) $< $(FP8_FUSED_FLAGS) \
+		-DBLOCK_SIZE_VAL=$(firstword $(subst _, ,$*)) -DHK_MODULE_NAME=hk_fp8_tn_$* \
+		-o $@ 2>&1
+
+fp8_inkernel: hk_fp8_nn_128$(PY_EXT) hk_fp8_nn_256$(PY_EXT) \
+              hk_fp8_tt_128$(PY_EXT) hk_fp8_tt_256$(PY_EXT) \
+              hk_fp8_tn_128$(PY_EXT) hk_fp8_tn_256$(PY_EXT)

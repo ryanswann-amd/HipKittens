@@ -77,21 +77,21 @@ _KERNELS = {
     ('fp8_e4m3', 'nt', 128): 'hk_fp8_native_nt_128',
     ('fp8_e5m2', 'nt', 256): 'hk_fp8_native_nt_256',
     ('fp8_e5m2', 'nt', 128): 'hk_fp8_native_nt_128',
-    # FP8 fused NN (transpose B + NT)
-    ('fp8_e4m3', 'nn', 256): 'hk_fp8_nn_fused_256x256x64',
-    ('fp8_e4m3', 'nn', 128): 'hk_fp8_nn_fused_128x128x64',
-    ('fp8_e5m2', 'nn', 256): 'hk_fp8_nn_fused_256x256x64',
-    ('fp8_e5m2', 'nn', 128): 'hk_fp8_nn_fused_128x128x64',
-    # FP8 fused TT (transpose A + NT)
-    ('fp8_e4m3', 'tt', 256): 'hk_fp8_tt_fused_256x256x64',
-    ('fp8_e4m3', 'tt', 128): 'hk_fp8_tt_fused_128x128x64',
-    ('fp8_e5m2', 'tt', 256): 'hk_fp8_tt_fused_256x256x64',
-    ('fp8_e5m2', 'tt', 128): 'hk_fp8_tt_fused_128x128x64',
-    # FP8 fused TN (transpose A+B + NT)
-    ('fp8_e4m3', 'tn', 256): 'hk_fp8_tn_fused_256x256x64',
-    ('fp8_e4m3', 'tn', 128): 'hk_fp8_tn_fused_128x128x64',
-    ('fp8_e5m2', 'tn', 256): 'hk_fp8_tn_fused_256x256x64',
-    ('fp8_e5m2', 'tn', 128): 'hk_fp8_tn_fused_128x128x64',
+    # FP8 in-kernel NN (transpose B in shared, no workspace)
+    ('fp8_e4m3', 'nn', 256): 'hk_fp8_nn_256',
+    ('fp8_e4m3', 'nn', 128): 'hk_fp8_nn_128',
+    ('fp8_e5m2', 'nn', 256): 'hk_fp8_nn_256',
+    ('fp8_e5m2', 'nn', 128): 'hk_fp8_nn_128',
+    # FP8 in-kernel TT (transpose A in shared, no workspace)
+    ('fp8_e4m3', 'tt', 256): 'hk_fp8_tt_256',
+    ('fp8_e4m3', 'tt', 128): 'hk_fp8_tt_128',
+    ('fp8_e5m2', 'tt', 256): 'hk_fp8_tt_256',
+    ('fp8_e5m2', 'tt', 128): 'hk_fp8_tt_128',
+    # FP8 in-kernel TN (transpose both in shared, no workspace)
+    ('fp8_e4m3', 'tn', 256): 'hk_fp8_tn_256',
+    ('fp8_e4m3', 'tn', 128): 'hk_fp8_tn_128',
+    ('fp8_e5m2', 'tn', 256): 'hk_fp8_tn_256',
+    ('fp8_e5m2', 'tn', 128): 'hk_fp8_tn_128',
 }
 
 # Tile preference order per (dtype, transpose) — try larger tiles first
