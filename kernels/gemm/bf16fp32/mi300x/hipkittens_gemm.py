@@ -66,6 +66,15 @@ _KERNELS = {
     ('fp16', 'tn', 256): 'hk_fp16_tn_fused_256x256x64',
     ('fp16', 'tn', 192): 'hk_fp16_tn_192x192x64',
     ('fp16', 'tn', 128): 'hk_fp16_tn_128x128x64',
+    # FP32 native NT
+    ('fp32', 'nt', 256): 'hk_fp32_native_nt_256',
+    ('fp32', 'nt', 192): 'hk_fp32_native_nt_192',
+    ('fp32', 'nt', 128): 'hk_fp32_native_nt_128',
+    # FP8 native NT (32x32 MFMA — only 128 and 256 divide cleanly)
+    ('fp8_e4m3', 'nt', 256): 'hk_fp8_native_nt_256',
+    ('fp8_e4m3', 'nt', 128): 'hk_fp8_native_nt_128',
+    ('fp8_e5m2', 'nt', 256): 'hk_fp8_native_nt_256',
+    ('fp8_e5m2', 'nt', 128): 'hk_fp8_native_nt_128',
 }
 
 # Tile preference order per (dtype, transpose) — try larger tiles first
@@ -78,6 +87,9 @@ _TILE_PREF = {
     ('fp16', 'nn'): [256, 192, 128],
     ('fp16', 'tt'): [256, 192, 128],
     ('fp16', 'tn'): [256, 192, 128],
+    ('fp32', 'nt'): [256, 192, 128],
+    ('fp8_e4m3', 'nt'): [256, 128],
+    ('fp8_e5m2', 'nt'): [256, 128],
 }
 
 _loaded = {}
@@ -173,11 +185,8 @@ def gemm(A, B, C=None, trans='nt'):
     dk = _dtype_key(A)
     out_dtype = A.dtype
 
-    # FP8/FP32: convert to BF16 and dispatch via BF16 kernels
-    if dk.startswith('fp8') or dk == 'fp32':
-        A = A.to(torch.bfloat16)
-        B = B.to(torch.bfloat16)
-        dk = 'bf16'
+    # Try native kernel first; fall back to BF16 conversion if unavailable
+    native_dk = dk
 
     if trans == 'nt':
         M, K = A.shape; N = B.shape[0]
@@ -190,14 +199,30 @@ def gemm(A, B, C=None, trans='nt'):
     else:
         raise ValueError(f"Unknown transpose '{trans}'. Use 'nt', 'nn', 'tt', or 'tn'.")
 
-    # For FP8 inputs, output is always BF16 (the compute dtype)
-    c_dtype = torch.bfloat16 if dk == 'bf16' else (torch.float16 if dk == 'fp16' else torch.bfloat16)
+    # Output dtype: FP32 for FP8/FP32 native kernels, same dtype for BF16/FP16
+    if dk in ('fp32', 'fp8_e4m3', 'fp8_e5m2'):
+        c_dtype = torch.float32
+    elif dk == 'fp16':
+        c_dtype = torch.float16
+    else:
+        c_dtype = torch.bfloat16
+
+    # Try native kernel first
+    mod, bs = _select_tile(dk, trans, M, N, K)
+
+    # Fall back to BF16 conversion if no native kernel available
+    if mod is None and dk in ('fp32', 'fp8_e4m3', 'fp8_e5m2'):
+        A = A.to(torch.bfloat16)
+        B = B.to(torch.bfloat16)
+        dk = 'bf16'
+        c_dtype = torch.bfloat16
+        mod, bs = _select_tile(dk, trans, M, N, K)
+
+    if mod is None:
+        raise RuntimeError(f"No kernel for {native_dk} {trans} M={M} N={N} K={K}")
+
     if C is None:
         C = torch.zeros(M, N, dtype=c_dtype, device=A.device)
-
-    mod, bs = _select_tile(dk, trans, M, N, K)
-    if mod is None:
-        raise RuntimeError(f"No kernel for {dk} {trans} M={M} N={N} K={K}")
 
     mod.dispatch(A, B, C)
     return C
