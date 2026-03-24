@@ -61,8 +61,8 @@ void fp8_gemm_nt(float* __restrict__ C, const char* __restrict__ A,
             long bv = *(const long*)&Bs[b_row][k_base];
 
             __builtin_amdgcn_sched_group_barrier(0x2, 3, 0);  // 3 DS reads
-            mfma_fp8(c0, a0, bv, c0);
-            mfma_fp8(c1, a1, bv, c1);
+            __builtin_amdgcn_s_setprio(1); mfma_fp8(c0, a0, bv, c0);
+            mfma_fp8(c1, a1, bv, c1); __builtin_amdgcn_s_setprio(0);
             __builtin_amdgcn_sched_group_barrier(0x8, 2, 0);  // 2 MFMAs
         }
 
@@ -81,8 +81,8 @@ void fp8_gemm_nt(float* __restrict__ C, const char* __restrict__ A,
         long a0=*(const long*)&As[a_row0][k_base], a1=*(const long*)&As[a_row1][k_base];
         long bv=*(const long*)&Bs[b_row][k_base];
         asm volatile("s_waitcnt lgkmcnt(0)");
-        mfma_fp8(c0, a0, bv, c0);
-        mfma_fp8(c1, a1, bv, c1);
+        __builtin_amdgcn_s_setprio(1); mfma_fp8(c0, a0, bv, c0);
+        mfma_fp8(c1, a1, bv, c1); __builtin_amdgcn_s_setprio(0);
     }
 
     // Store: 32x32 output, 16 values per thread
