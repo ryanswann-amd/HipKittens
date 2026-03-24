@@ -161,6 +161,16 @@ def _select_tile_best(dtype_key, trans, M, N, K):
     if cache_key in _tile_cache:
         return _tile_cache[cache_key]
 
+    # Fast path: if 256 tile is valid AND shape is large enough, use it directly.
+    # The 256 tile is empirically best for large shapes (>= 2048 in both dims).
+    # Skip auto-tuning to avoid noisy benchmark artifacts.
+    if M % 256 == 0 and N % 256 == 0 and K % 64 == 0 and M >= 2048 and N >= 2048:
+        mod_256 = _load((dtype_key, trans, 256))
+        if mod_256 is not None:
+            result = (mod_256, 256)
+            _tile_cache[cache_key] = result
+            return result
+
     # Collect all valid tiles (square + rectangular)
     candidates = []
 
@@ -197,25 +207,27 @@ def _select_tile_best(dtype_key, trans, M, N, K):
         _tile_cache[cache_key] = result
         return result
 
-    # Benchmark each candidate with 3 runs
+    # Benchmark each candidate: 2 warmup + 5 timed runs for stable results
     import torch
     best_tf, best_mod, best_bs = 0, None, 0
-    A_test = torch.randn(M, K, device='cuda', dtype=torch.bfloat16 if dtype_key == 'bf16' else torch.float16) / 10
-    B_test = torch.randn(N, K, device='cuda', dtype=torch.bfloat16 if dtype_key == 'bf16' else torch.float16) / 10
+    dt = torch.bfloat16 if dtype_key == 'bf16' else torch.float16
+    A_test = torch.randn(M, K, device='cuda', dtype=dt) / 10
+    B_test = torch.randn(N, K, device='cuda', dtype=dt) / 10
     C_test = torch.zeros(M, N, dtype=A_test.dtype, device='cuda')
 
     for mod, bm, bn in candidates:
         try:
-            mod.dispatch(A_test, B_test, C_test)  # warmup
+            # 2 warmup runs
+            for _ in range(2): mod.dispatch(A_test, B_test, C_test)
             torch.cuda.synchronize()
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
             s.record()
-            for _ in range(3):
+            for _ in range(5):
                 mod.dispatch(A_test, B_test, C_test)
             e.record()
             torch.cuda.synchronize()
-            tf = 2 * M * N * K / (s.elapsed_time(e) / 3) / 1e9
+            tf = 2 * M * N * K / (s.elapsed_time(e) / 5) / 1e9
             if tf > best_tf:
                 best_tf, best_mod, best_bs = tf, mod, max(bm, bn)
         except:
