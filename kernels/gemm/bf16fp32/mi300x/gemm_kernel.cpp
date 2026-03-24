@@ -175,7 +175,7 @@ void gemm_kernel(const bf16* __restrict__ A,
             b_reg[i] = *reinterpret_cast<float4*>(&raw);
         }
 
-        // Compute all K_SLICES on tic buffer
+        // Compute all K_SLICES on tic buffer with sched_group_barrier hints
         {
             const bf16* a_base = smem_A[tic] + a_warp_off;
             const bf16* b_base = smem_B[tic] + b_warp_off;
@@ -183,6 +183,8 @@ void gemm_kernel(const bf16* __restrict__ A,
             #pragma unroll
             for (int ks = 0; ks < K_SLICES; ++ks) {
                 const int k_off = ks * DOT_SLICE;
+
+                // Load A fragments
                 #pragma unroll
                 for (int bm = 0; bm < MFMA_M; ++bm) {
                     bf16_2* fp = &a_frag.tiles[bm][0].data[0];
@@ -190,6 +192,7 @@ void gemm_kernel(const bf16* __restrict__ A,
                     fp[0] = *reinterpret_cast<const bf16_2*>(tp);
                     fp[1] = *reinterpret_cast<const bf16_2*>(tp + 2);
                 }
+                // Load B fragments
                 #pragma unroll
                 for (int bn = 0; bn < MFMA_N; ++bn) {
                     bf16_2* fp = &b_frag.tiles[bn][0].data[0];
@@ -197,7 +200,13 @@ void gemm_kernel(const bf16* __restrict__ A,
                     fp[0] = *reinterpret_cast<const bf16_2*>(tp);
                     fp[1] = *reinterpret_cast<const bf16_2*>(tp + 2);
                 }
+
+                // Scheduling hints: allow DS reads to issue, then MFMA
+                // DS_READ_MASK=0x100, MFMA_MASK=0x008, VMEM_MASK=0x020
+                __builtin_amdgcn_sched_group_barrier(0x100, MFMA_M + MFMA_N, 0); // ds reads
+                __builtin_amdgcn_sched_group_barrier(0x008, MFMA_M * MFMA_N, 0); // MFMAs
                 mma_ABt(C_accum, a_frag, b_frag, C_accum);
+                __builtin_amdgcn_sched_barrier(0); // reset
             }
         }
 
