@@ -256,3 +256,25 @@ fp16_fused: hk_fp16_nn_fused_256x256x64$(PY_EXT) hk_fp16_tt_fused_256x256x64$(PY
 
 fp16_tt: hk_fp16_tt_128x128x64$(PY_EXT) hk_fp16_tt_192x192x64$(PY_EXT)
 fp16_tn: hk_fp16_tn_128x128x64$(PY_EXT) hk_fp16_tn_192x192x64$(PY_EXT)
+
+# ===== Native FP32 kernels =====
+fp32_native: hk_fp32_native_nt_128$(PY_EXT) hk_fp32_native_nt_192$(PY_EXT) hk_fp32_native_nt_256$(PY_EXT)
+
+hk_fp32_native_nt_%$(PY_EXT): fp32_native_nt_kernel.cpp
+	$(HIPCXX) $< $(HIPFLAGS) -std=$(CXX_STD) -w -shared -fPIC \
+		-I$(CDNA3_HEADERS)/include -I$(CDNA3_HEADERS)/prototype \
+		-I$(ROCM_INCLUDE_DIR) -I$(HIP_INCLUDE_DIR) \
+		$(PY_INCLUDES) $(PY_LDFLAGS) \
+		-DBLOCK_SIZE_VAL=$(firstword $(subst _, ,$*)) -DHK_MODULE_NAME=hk_fp32_native_nt_$* \
+		-o $@ 2>&1
+
+# ===== Native FP8 kernels =====
+fp8_native: hk_fp8_native_nt_128$(PY_EXT) hk_fp8_native_nt_192$(PY_EXT) hk_fp8_native_nt_256$(PY_EXT)
+
+hk_fp8_native_nt_%$(PY_EXT): fp8_native_nt_kernel.cpp
+	$(HIPCXX) $< $(HIPFLAGS) -std=$(CXX_STD) -w -shared -fPIC \
+		-I$(CDNA3_HEADERS)/include -I$(CDNA3_HEADERS)/prototype \
+		-I$(ROCM_INCLUDE_DIR) -I$(HIP_INCLUDE_DIR) \
+		$(PY_INCLUDES) $(PY_LDFLAGS) \
+		-DBLOCK_SIZE_VAL=$(firstword $(subst _, ,$*)) -DHK_MODULE_NAME=hk_fp8_native_nt_$* \
+		-o $@ 2>&1

@@ -1,3 +1,6 @@
+#ifndef BLOCK_SIZE_VAL
+#define BLOCK_SIZE_VAL 128
+#endif
 // Native FP32 NT GEMM — buffer_load + inline ASM MFMA scheduling
 // Uses make_srsrc + llvm_amdgcn_raw_buffer_load_b128 for global reads
 // (same path as BF16 HK kernel) and inline ASM for MFMA waitcnt control.
@@ -6,7 +9,7 @@
 #include <pybind11/pybind11.h>
 using namespace kittens;
 
-constexpr int BS=128, KS=16, NW=8, WS=64, NT=NW*WS, T=16, DK=4, RB=BS/4, KI=KS/DK;
+constexpr int BS=BLOCK_SIZE_VAL, KS=16, NW=8, WS=64, NT=NW*WS, T=16, DK=4, RB=BS/4, KI=KS/DK;
 typedef __attribute__((__vector_size__(16))) float f4v;
 
 __global__ __launch_bounds__(NT, 4)

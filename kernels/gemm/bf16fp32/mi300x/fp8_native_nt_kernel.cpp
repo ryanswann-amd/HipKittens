@@ -1,3 +1,6 @@
+#ifndef BLOCK_SIZE_VAL
+#define BLOCK_SIZE_VAL 128
+#endif
 // Native FP8 NT GEMM — optimized with buffer_load + sched_group_barrier
 // v_mfma_f32_32x32x16_fp8_fp8: 32768 FLOPs per instruction, K=16
 // Each thread provides 8 packed fp8 (long = 64 bits) for A and B.
@@ -6,7 +9,7 @@
 #include <pybind11/pybind11.h>
 using namespace kittens;
 
-constexpr int BS=128, KS=32, NW=8, WS=64, NT=NW*WS;
+constexpr int BS=BLOCK_SIZE_VAL, KS=32, NW=8, WS=64, NT=NW*WS;
 constexpr int T=32, DK=16, RB=T, KI=KS/DK;  // KI=2
 
 __device__ inline void mfma_fp8(float (&D)[16], long A, long B, const float (&C)[16]) {
