@@ -154,3 +154,24 @@ hk_fp16_nn_192x192x64$(PY_EXT): fp16_nn_kernel.cpp
 		-o $@ 2>&1
 
 fp16_nn: hk_fp16_nn_128x128x64$(PY_EXT) hk_fp16_nn_192x192x64$(PY_EXT)
+
+# BF16 TT kernels — transposed A load, normal B load
+hk_tt_128x128x64$(PY_EXT): tt_kernel.cpp
+	$(HIPCXX) $< $(CDNA3_NN_FLAGS) \
+		-DBLOCK_SIZE_VAL=128 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_tt_128x128x64 \
+		-o $@ 2>&1
+
+hk_tt_192x192x64$(PY_EXT): tt_kernel.cpp
+	$(HIPCXX) $< $(CDNA3_NN_FLAGS) \
+		-DBLOCK_SIZE_VAL=192 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_tt_192x192x64 \
+		-o $@ 2>&1
+
+tt: hk_tt_128x128x64$(PY_EXT) hk_tt_192x192x64$(PY_EXT)
+
+# BF16 TN kernels — both A and B transposed
+hk_tn_128x128x64$(PY_EXT): tn_kernel.cpp
+	$(HIPCXX) $< $(CDNA3_NN_FLAGS) \
+		-DBLOCK_SIZE_VAL=128 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_tn_128x128x64 \
+		-o $@ 2>&1
+
+tn: hk_tn_128x128x64$(PY_EXT)
