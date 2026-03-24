@@ -278,3 +278,28 @@ hk_fp8_native_nt_%$(PY_EXT): fp8_native_nt_kernel.cpp
 		$(PY_INCLUDES) $(PY_LDFLAGS) \
 		-DBLOCK_SIZE_VAL=$(firstword $(subst _, ,$*)) -DHK_MODULE_NAME=hk_fp8_native_nt_$* \
 		-o $@ 2>&1
+
+# FP8 fused transpose kernels (NN, TT, TN)
+FP8_FUSED_FLAGS = $(HIPFLAGS) -std=$(CXX_STD) -w -shared -fPIC \
+	-I$(CDNA3_HEADERS)/include -I$(CDNA3_HEADERS)/prototype \
+	-I$(ROCM_INCLUDE_DIR) -I$(HIP_INCLUDE_DIR) \
+	$(PY_INCLUDES) $(PY_LDFLAGS)
+
+hk_fp8_nn_fused_%$(PY_EXT): fp8_nn_fused_kernel.cpp
+	$(HIPCXX) $< $(FP8_FUSED_FLAGS) \
+		-DBLOCK_SIZE_VAL=$(firstword $(subst x, ,$*)) -DHK_MODULE_NAME=hk_fp8_nn_fused_$* \
+		-o $@ 2>&1
+
+hk_fp8_tt_fused_%$(PY_EXT): fp8_tt_fused_kernel.cpp
+	$(HIPCXX) $< $(FP8_FUSED_FLAGS) \
+		-DBLOCK_SIZE_VAL=$(firstword $(subst x, ,$*)) -DHK_MODULE_NAME=hk_fp8_tt_fused_$* \
+		-o $@ 2>&1
+
+hk_fp8_tn_fused_%$(PY_EXT): fp8_tn_fused_kernel.cpp
+	$(HIPCXX) $< $(FP8_FUSED_FLAGS) \
+		-DBLOCK_SIZE_VAL=$(firstword $(subst x, ,$*)) -DHK_MODULE_NAME=hk_fp8_tn_fused_$* \
+		-o $@ 2>&1
+
+fp8_fused: hk_fp8_nn_fused_256x256x64$(PY_EXT) hk_fp8_nn_fused_128x128x64$(PY_EXT) \
+           hk_fp8_tt_fused_256x256x64$(PY_EXT) hk_fp8_tt_fused_128x128x64$(PY_EXT) \
+           hk_fp8_tn_fused_256x256x64$(PY_EXT) hk_fp8_tn_fused_128x128x64$(PY_EXT)
