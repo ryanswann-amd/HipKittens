@@ -31,8 +31,9 @@ typedef __attribute__((__vector_size__(16*sizeof(float)))) float f16v;
 
 // Load B from KxN global and write TRANSPOSED (NxK) into shared Bs.
 // Groups: 4 K-rows × 16 N-elements per batch. Writes 4 bytes per N position (ds_write_b32).
+template<int KS_STRIDE>
 __device__ void load_B_nn_fp8(
-    char Bs[][KS],
+    char Bs[][KS_STRIDE],
     const char* __restrict__ B_base,  // B_KxN base for this tile
     int N_stride,                      // stride between K-rows in global (= N)
     int k_offset)                      // k_tile * KS
@@ -71,7 +72,11 @@ __device__ void load_B_nn_fp8(
 __global__ __launch_bounds__(NT, 2)
 void fp8_gemm_nn(float* __restrict__ C, const char* __restrict__ A,
                  const char* __restrict__ B, int M, int N, int K) {
-    __shared__ char As[BS][KS], Bs[BS][KS];
+    // Bs has +4 padding to eliminate LDS bank conflicts on transposed writes
+    // bank = (byte_addr/4) % 32. With stride KS, bank repeats every 8 rows.
+    // Padding changes stride to KS+4, making gcd(stride/4, 32) = 1 → no conflicts.
+    constexpr int BS_PAD = KS + 4;
+    __shared__ char As[BS][KS], Bs[BS][BS_PAD];
     const int nn=N/BS; int wgid=blockIdx.x;
     {int W=4,ch=W*W,nc=(gridDim.x+ch-1)/ch; wgid=(wgid%nc)*ch+wgid/nc;}
     int tm=wgid/nn, tn=wgid%nn;
