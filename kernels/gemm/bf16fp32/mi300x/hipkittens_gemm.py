@@ -25,6 +25,14 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 if _DIR not in sys.path:
     sys.path.insert(0, _DIR)
 
+# Origami analytical model for tile selection
+try:
+    import origami
+    _origami_hw = origami.get_hardware_for_device(0)
+    _USE_ORIGAMI = True
+except ImportError:
+    _USE_ORIGAMI = False
+
 # Kernel registry: (dtype, transpose, block_size) → module_name
 _KERNELS = {
     # BF16 NT (highest perf — 256x256 is best)
@@ -99,14 +107,49 @@ def _dtype_key(t):
     raise ValueError(f"Unsupported dtype {t.dtype}. Use float32, bfloat16, float16, or float8.")
 
 def _select_tile(dtype_key, trans, M, N, K):
-    """Select the best tile size for given problem."""
+    """Select the best tile size for given problem using Origami if available."""
     prefs = _TILE_PREF.get((dtype_key, trans), [128])
+
+    # Filter to tiles that divide M, N, K
+    valid = []
     for bs in prefs:
         if M % bs == 0 and N % bs == 0 and K % 64 == 0:
             mod = _load((dtype_key, trans, bs))
             if mod is not None:
+                valid.append((bs, mod))
+
+    if not valid:
+        return None, 0
+
+    if len(valid) == 1:
+        return valid[0][1], valid[0][0]
+
+    # Use Origami to rank valid tiles
+    if _USE_ORIGAMI:
+        problem = origami.problem_t()
+        problem.size = origami.dim3_t(M, N, K)
+        problem.a_dtype = origami.data_type_t.BFloat16
+        problem.b_dtype = origami.data_type_t.BFloat16
+        problem.c_dtype = origami.data_type_t.Float
+        problem.d_dtype = origami.data_type_t.Float
+
+        configs = []
+        for bs, mod in valid:
+            c = origami.config_t()
+            c.mt = origami.dim3_t(bs, bs, 64)
+            c.mi = origami.dim3_t(16, 16, 16)
+            configs.append((bs, mod, c))
+
+        oc = [c for _, _, c in configs]
+        result = origami.select_config(problem, _origami_hw, oc)
+        best_bs = result.config.mt.m
+
+        for bs, mod, _ in configs:
+            if bs == best_bs:
                 return mod, bs
-    return None, 0
+
+    # Fallback: first valid tile (largest)
+    return valid[0][1], valid[0][0]
 
 def gemm(A, B, C=None, trans='nt'):
     """Run GEMM with auto-selected kernel.
