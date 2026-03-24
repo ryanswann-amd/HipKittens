@@ -198,14 +198,24 @@ def _select_tile_best(dtype_key, trans, M, N, K):
         _tile_cache[cache_key] = result
         return result
 
-    # For large shapes with multiple candidates, benchmark to find the best
-    # For small shapes (<512), just use the largest tile (launch overhead dominates)
-    if M * N < 512 * 512:
-        # Pick tile with largest min dimension (best per-tile efficiency)
-        best = max(candidates, key=lambda c: min(c[1], c[2]) * 1000 + max(c[1], c[2]))
-        result = (best[0], max(best[1], best[2]))
-        _tile_cache[cache_key] = result
-        return result
+    # For small/medium shapes, use heuristic instead of noisy benchmark.
+    # Primary: maximize WGs for GPU saturation (critical for small shapes).
+    # Secondary: prefer larger min(bm,bn) for better per-tile efficiency.
+    # Constraint: need at least ~48 WGs for reasonable GPU utilization.
+    if M * N < 2048 * 2048:
+        best_score, best_mod, best_bs = 0, None, 0
+        for mod, bm, bn in candidates:
+            wgs = (M // bm) * (N // bn)
+            min_dim = min(bm, bn)
+            # Score: WGs dominates, min_dim is tiebreaker
+            score = min(wgs, 608) * 10000 + min_dim
+            if score > best_score:
+                best_score = score
+                best_mod, best_bs = mod, max(bm, bn)
+        if best_mod:
+            result = (best_mod, best_bs)
+            _tile_cache[cache_key] = result
+            return result
 
     # Benchmark each candidate: 2 warmup + 5 timed runs for stable results
     import torch
