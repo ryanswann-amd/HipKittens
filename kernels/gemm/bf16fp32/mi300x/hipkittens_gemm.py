@@ -31,7 +31,8 @@ _KERNELS = {
     ('bf16', 'nt', 256): 'hk_256x256',
     ('bf16', 'nt', 192): 'hk_192x192x64',
     ('bf16', 'nt', 128): 'hk_128x128x64',
-    # BF16 NN
+    # BF16 NN (fused transpose+NT for 256x256 at large sizes)
+    ('bf16', 'nn', 256): 'hk_nn_fused_256x256x64',
     ('bf16', 'nn', 192): 'hk_nn_192x192x64',
     ('bf16', 'nn', 128): 'hk_nn_128x128x64',
     # BF16 TT
@@ -57,7 +58,7 @@ _KERNELS = {
 # Tile preference order per (dtype, transpose) — try larger tiles first
 _TILE_PREF = {
     ('bf16', 'nt'): [256, 192, 128],
-    ('bf16', 'nn'): [192, 128],
+    ('bf16', 'nn'): [256, 192, 128],  # 256=fused for large N, 192/128 for small
     ('bf16', 'tt'): [192, 128],
     ('bf16', 'tn'): [192, 128],
     ('fp16', 'nt'): [256, 128],
