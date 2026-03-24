@@ -192,5 +192,15 @@ hk_fp16_tn_128x128x64$(PY_EXT): fp16_tn_kernel.cpp
 		-DBLOCK_SIZE_VAL=128 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_fp16_tn_128x128x64 \
 		-o $@ 2>&1
 
-fp16_tt: hk_fp16_tt_128x128x64$(PY_EXT)
-fp16_tn: hk_fp16_tn_128x128x64$(PY_EXT)
+hk_fp16_tt_192x192x64$(PY_EXT): fp16_tt_kernel.cpp
+	$(HIPCXX) $< $(FP16_FLAGS) \
+		-DBLOCK_SIZE_VAL=192 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_fp16_tt_192x192x64 \
+		-o $@ 2>&1
+
+hk_fp16_tn_192x192x64$(PY_EXT): fp16_tn_kernel.cpp
+	$(HIPCXX) $< $(FP16_FLAGS) \
+		-DBLOCK_SIZE_VAL=192 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_fp16_tn_192x192x64 \
+		-o $@ 2>&1
+
+fp16_tt: hk_fp16_tt_128x128x64$(PY_EXT) hk_fp16_tt_192x192x64$(PY_EXT)
+fp16_tn: hk_fp16_tn_128x128x64$(PY_EXT) hk_fp16_tn_192x192x64$(PY_EXT)
