@@ -3,3 +3,6 @@
 # Metrics: tflops_4096
 iter	timestamp	metric	prev	delta_pct	status	commit	description
 0	2026-03-24T17:17:43+00:00	355.7	-	-	BASELINE	b09ee8d6	Initial baseline: FP8 NN in-kernel BS=128 124VGPRs occ4
+1	2026-03-24T17:28:56+00:00	311.8	355.7	-12.3	REVERT	-	K_GROUP=8 ds_write_b64: occ dropped 6→4, 302 TF
+2	2026-03-24T17:28:56+00:00	263.9	355.7	-25.8	REVERT	-	KS=64: LDS doubled 8→16KB, occ 6→4, 264 TF
+3	2026-03-24T17:33:52+00:00	421.1	355.7	+18.4	KEEP	-	BS=256 in-kernel NN: 194 VGPRs occ 2, 421 TF (+35% vs BS=128 baseline)

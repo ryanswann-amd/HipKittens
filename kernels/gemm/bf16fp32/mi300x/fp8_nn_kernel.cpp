@@ -108,7 +108,7 @@ void fp8_gemm_nn(float* __restrict__ C, const char* __restrict__ A,
 
     const int num_tiles = K/KS;
     for(int kt=0; kt<num_tiles-1; kt++) {
-        // 1. Prefetch A for next tile (overlapped with compute)
+        // 1. Prefetch A for next tile
         float4 a_buf;
         {int i=threadIdx.x; if(i<total_a_loads) {
             int r=i/(KS/16),c16=(i%(KS/16))*16;
@@ -134,7 +134,7 @@ void fp8_gemm_nn(float* __restrict__ C, const char* __restrict__ A,
             __builtin_amdgcn_s_setprio(0);
         }
 
-        // 3. Wait for A prefetch, store A to shared, transpose-load B directly
+        // 3. Store A + transpose-load B
         asm volatile("s_waitcnt vmcnt(0)");
         __builtin_amdgcn_s_barrier();
         {int i=threadIdx.x; if(i<total_a_loads) {
