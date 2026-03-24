@@ -24,13 +24,13 @@ constexpr int NCOL = BS / (T * 4);
 constexpr int NACC = NROW * NCOL;
 static_assert(NROW * 2 * T == BS, "BS must be divisible by 2*T");
 static_assert(NCOL * 4 * T == BS, "BS must be divisible by 4*T");
-static_assert(KI == 2, "Optimized for KI=2");
+static_assert(KI >= 2, "KS must be at least 2*DK=32");
 typedef __attribute__((__vector_size__(16*sizeof(float)))) float f16v;
 
 #define MFMA(acc, a, b) acc = __builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8(a, b, acc, 0, 0, 0)
 
 // Load B from KxN global and write TRANSPOSED (NxK) into shared Bs.
-// Groups: 4 K-rows × 16 N-elements per batch. Writes 4 bytes per N position.
+// Groups: 4 K-rows × 16 N-elements per batch. Writes 4 bytes per N position (ds_write_b32).
 __device__ void load_B_nn_fp8(
     char Bs[][KS],
     const char* __restrict__ B_base,  // B_KxN base for this tile
@@ -39,9 +39,9 @@ __device__ void load_B_nn_fp8(
 {
     constexpr int N_GROUP = 16;  // N-elements per float4 load
     constexpr int K_GROUP = 4;   // K-rows loaded together
-    constexpr int N_BATCHES = BS / N_GROUP;     // 128/16 = 8
-    constexpr int K_BATCHES = KS / K_GROUP;     // 32/4 = 8
-    constexpr int TOTAL = K_BATCHES * N_BATCHES; // 64
+    constexpr int N_BATCHES = BS / N_GROUP;
+    constexpr int K_BATCHES = KS / K_GROUP;
+    constexpr int TOTAL = K_BATCHES * N_BATCHES;
 
     #pragma unroll 1
     for (int batch = threadIdx.x; batch < TOTAL; batch += NT) {
@@ -50,27 +50,19 @@ __device__ void load_B_nn_fp8(
         int k = kb * K_GROUP;
         int n = nb * N_GROUP;
 
-        // Load 4 consecutive K-rows, 16 contiguous N-elements each (coalesced)
-        const char* row0 = B_base + (k_offset + k + 0) * N_stride + n;
-        const char* row1 = B_base + (k_offset + k + 1) * N_stride + n;
-        const char* row2 = B_base + (k_offset + k + 2) * N_stride + n;
-        const char* row3 = B_base + (k_offset + k + 3) * N_stride + n;
+        const char* base = B_base + (k_offset + k) * N_stride + n;
+        float4 r0 = *(const float4*)(base);
+        float4 r1 = *(const float4*)(base + N_stride);
+        float4 r2 = *(const float4*)(base + 2*N_stride);
+        float4 r3 = *(const float4*)(base + 3*N_stride);
 
-        float4 r0 = *(const float4*)row0;
-        float4 r1 = *(const float4*)row1;
-        float4 r2 = *(const float4*)row2;
-        float4 r3 = *(const float4*)row3;
+        const char *b0=(const char*)&r0, *b1=(const char*)&r1,
+                   *b2=(const char*)&r2, *b3=(const char*)&r3;
 
-        const char* b0 = (const char*)&r0;
-        const char* b1 = (const char*)&r1;
-        const char* b2 = (const char*)&r2;
-        const char* b3 = (const char*)&r3;
-
-        // Write transposed: for each N position, write 4 K-values as int (ds_write_b32)
         #pragma unroll
         for (int i = 0; i < N_GROUP; i++) {
             union { char c[4]; int w; } col;
-            col.c[0] = b0[i]; col.c[1] = b1[i]; col.c[2] = b2[i]; col.c[3] = b3[i];
+            col.c[0]=b0[i]; col.c[1]=b1[i]; col.c[2]=b2[i]; col.c[3]=b3[i];
             *(int*)&Bs[n + i][k] = col.w;
         }
     }
@@ -114,35 +106,14 @@ void fp8_gemm_nn(float* __restrict__ C, const char* __restrict__ A,
     asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)");
     __builtin_amdgcn_s_barrier();
 
-    // B transpose constants for pipelining
-    constexpr int B_N_GROUP = 16, B_K_GROUP = 4;
-    constexpr int B_N_BATCHES = BS / B_N_GROUP;
-    constexpr int B_K_BATCHES = KS / B_K_GROUP;
-    constexpr int B_TOTAL = B_K_BATCHES * B_N_BATCHES;
-    // Each thread's batch assignment (if any)
-    const int b_batch = threadIdx.x;  // only threads < B_TOTAL participate
-
     const int num_tiles = K/KS;
     for(int kt=0; kt<num_tiles-1; kt++) {
-        // 1. Prefetch BOTH A and B for next tile (overlapped with compute)
+        // 1. Prefetch A for next tile (overlapped with compute)
         float4 a_buf;
-        float4 b_rows[4];  // 4 K-rows of 16 N-elements each
         {int i=threadIdx.x; if(i<total_a_loads) {
             int r=i/(KS/16),c16=(i%(KS/16))*16;
             __uint128_t ra=llvm_amdgcn_raw_buffer_load_b128(a_sr,r*K+(kt+1)*KS+c16,0,0);
             a_buf=*(float4*)&ra;}}
-        // Prefetch B: load 4 K-rows × 16 N-elements (strided global reads)
-        if (b_batch < B_TOTAL) {
-            int kb = b_batch / B_N_BATCHES;
-            int nb = b_batch % B_N_BATCHES;
-            int k = kb * B_K_GROUP;
-            int n = nb * B_N_GROUP;
-            int k_off = (kt+1)*KS;
-            b_rows[0] = *(const float4*)&Bb[(k_off+k+0)*N + B_n_offset + n];
-            b_rows[1] = *(const float4*)&Bb[(k_off+k+1)*N + B_n_offset + n];
-            b_rows[2] = *(const float4*)&Bb[(k_off+k+2)*N + B_n_offset + n];
-            b_rows[3] = *(const float4*)&Bb[(k_off+k+3)*N + B_n_offset + n];
-        }
 
         // 2. Compute on current shared tiles
         #pragma unroll
@@ -163,27 +134,13 @@ void fp8_gemm_nn(float* __restrict__ C, const char* __restrict__ A,
             __builtin_amdgcn_s_setprio(0);
         }
 
-        // 3. Wait for global loads, store A + transpose-write B to shared
+        // 3. Wait for A prefetch, store A to shared, transpose-load B directly
         asm volatile("s_waitcnt vmcnt(0)");
         __builtin_amdgcn_s_barrier();
         {int i=threadIdx.x; if(i<total_a_loads) {
             int r=i/(KS/16),c16=(i%(KS/16))*16;
             *(float4*)&As[r][c16]=a_buf;}}
-        // Write B data transposed from registers to shared
-        if (b_batch < B_TOTAL) {
-            int kb = b_batch / B_N_BATCHES;
-            int nb = b_batch % B_N_BATCHES;
-            int k = kb * B_K_GROUP;
-            int n = nb * B_N_GROUP;
-            const char *p0=(const char*)&b_rows[0], *p1=(const char*)&b_rows[1],
-                       *p2=(const char*)&b_rows[2], *p3=(const char*)&b_rows[3];
-            #pragma unroll
-            for(int i=0; i<B_N_GROUP; i++) {
-                union { char c[4]; int w; } col;
-                col.c[0]=p0[i]; col.c[1]=p1[i]; col.c[2]=p2[i]; col.c[3]=p3[i];
-                *(int*)&Bs[n+i][k] = col.w;
-            }
-        }
+        load_B_nn_fp8(Bs, Bb + B_n_offset, N, (kt+1)*KS);
         asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_s_barrier();
     }
