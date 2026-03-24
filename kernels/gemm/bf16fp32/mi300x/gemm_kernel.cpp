@@ -91,49 +91,88 @@ void gemm_kernel(const bf16* __restrict__ A,
 
     int tic = 0, toc = 1;
 
-    // === PROLOGUE: Load first tile to buffer[tic] ===
+    // Buffer resource descriptors for A and B (hardware address calculation)
+    const int a_stride_bytes = K * sizeof(bf16);
+    const int b_stride_bytes = K * sizeof(bf16);
+    i32x4 a_srsrc = make_srsrc(A + row0 * K, BM * a_stride_bytes, a_stride_bytes);
+    i32x4 b_srsrc = make_srsrc(B + col0 * K, BN * b_stride_bytes, b_stride_bytes);
+
+    // Per-thread load parameters (computed once, reused every iteration)
+    constexpr int A_PER_T = (BM * a_f4pr + NTHREADS - 1) / NTHREADS;
+    constexpr int B_PER_T = (BN * b_f4pr + NTHREADS - 1) / NTHREADS;
+
+    // Pre-compute byte offsets for each thread's loads (invariant across K-tiles)
+    int a_byte_off[A_PER_T], b_byte_off[B_PER_T];
+    #pragma unroll
+    for (int i = 0; i < A_PER_T; ++i) {
+        int idx = tid + i * NTHREADS;
+        int r = idx / a_f4pr, c8 = (idx % a_f4pr) * 8;
+        a_byte_off[i] = (r * K + c8) * sizeof(bf16);
+    }
+    #pragma unroll
+    for (int i = 0; i < B_PER_T; ++i) {
+        int idx = tid + i * NTHREADS;
+        int r = idx / b_f4pr, c8 = (idx % b_f4pr) * 8;
+        b_byte_off[i] = (r * K + c8) * sizeof(bf16);
+    }
+
+    // LDS base pointers for writing
+    uint32_t a_lds = __builtin_amdgcn_readfirstlane(
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(smem_A[0])));
+    uint32_t b_lds = __builtin_amdgcn_readfirstlane(
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(smem_B[0])));
+    constexpr int SMEM_TILE = BM * BK * sizeof(bf16);  // bytes per A or B buffer
+
+    // === PROLOGUE: Load first tile via buffer_load → register → shared ===
     {
-        float4* da = reinterpret_cast<float4*>(smem_A[tic]);
-        float4* db = reinterpret_cast<float4*>(smem_B[tic]);
-        for (int i = tid; i < BM * a_f4pr; i += NTHREADS) {
-            int r = i / a_f4pr, c4 = i % a_f4pr;
-            da[i] = reinterpret_cast<const float4*>(A + (row0 + r) * K)[c4];
+        float4 a_reg[A_PER_T], b_reg[B_PER_T];
+        #pragma unroll
+        for (int i = 0; i < A_PER_T; ++i) {
+            __uint128_t raw = llvm_amdgcn_raw_buffer_load_b128(a_srsrc, a_byte_off[i], 0, 0);
+            a_reg[i] = *reinterpret_cast<float4*>(&raw);
         }
-        for (int i = tid; i < BN * b_f4pr; i += NTHREADS) {
-            int r = i / b_f4pr, c4 = i % b_f4pr;
-            db[i] = reinterpret_cast<const float4*>(B + (col0 + r) * K)[c4];
+        #pragma unroll
+        for (int i = 0; i < B_PER_T; ++i) {
+            __uint128_t raw = llvm_amdgcn_raw_buffer_load_b128(b_srsrc, b_byte_off[i], 0, 0);
+            b_reg[i] = *reinterpret_cast<float4*>(&raw);
+        }
+        asm volatile("s_waitcnt vmcnt(0)");
+        // Write to shared[tic]
+        #pragma unroll
+        for (int i = 0; i < A_PER_T; ++i) {
+            int idx = tid + i * NTHREADS;
+            uint32_t off = a_lds + tic * SMEM_TILE + idx * 16;
+            store_shared_vec(off, {a_reg[i].x, a_reg[i].y});
+            store_shared_vec(off + 8, {a_reg[i].z, a_reg[i].w});
+        }
+        #pragma unroll
+        for (int i = 0; i < B_PER_T; ++i) {
+            int idx = tid + i * NTHREADS;
+            uint32_t off = b_lds + tic * SMEM_TILE + idx * 16;
+            store_shared_vec(off, {b_reg[i].x, b_reg[i].y});
+            store_shared_vec(off + 8, {b_reg[i].z, b_reg[i].w});
         }
     }
-    __syncthreads();
+    asm volatile("s_waitcnt lgkmcnt(0)");
+    __builtin_amdgcn_s_barrier();
 
-    // === MAIN LOOP: compute on tic, load next to toc ===
+    // === MAIN LOOP: compute on tic, prefetch next to toc ===
     #pragma unroll 1
     for (int kt = 0; kt < num_k - 1; ++kt) {
-        // Issue BOTH global loads to registers (VMEM async — will overlap with compute)
-        const int next_k = (kt + 1) * BK;
-        // For 128x128x32: each thread loads exactly 1 float4 for A and 1 for B
-        // For larger tiles: more loads per thread (constexpr loop)
-        constexpr int A_PER_T = (BM * a_f4pr + NTHREADS - 1) / NTHREADS;
-        constexpr int B_PER_T = (BN * b_f4pr + NTHREADS - 1) / NTHREADS;
-        float4 a_reg[A_PER_T];
-        float4 b_reg[B_PER_T];
-        {
-            #pragma unroll
-            for (int i = 0; i < A_PER_T; ++i) {
-                int idx = tid + i * NTHREADS;
-                if (idx < BM * a_f4pr) {
-                    int r = idx / a_f4pr, c4 = idx % a_f4pr;
-                    a_reg[i] = reinterpret_cast<const float4*>(A + (row0 + r) * K + next_k)[c4];
-                }
-            }
-            #pragma unroll
-            for (int i = 0; i < B_PER_T; ++i) {
-                int idx = tid + i * NTHREADS;
-                if (idx < BN * b_f4pr) {
-                    int r = idx / b_f4pr, c4 = idx % b_f4pr;
-                    b_reg[i] = reinterpret_cast<const float4*>(B + (col0 + r) * K + next_k)[c4];
-                }
-            }
+        // Issue buffer_load for next K-tile (async VMEM — overlaps with MFMA)
+        const int k_byte_off = (kt + 1) * BK * sizeof(bf16);
+        float4 a_reg[A_PER_T], b_reg[B_PER_T];
+        #pragma unroll
+        for (int i = 0; i < A_PER_T; ++i) {
+            __uint128_t raw = llvm_amdgcn_raw_buffer_load_b128(
+                a_srsrc, a_byte_off[i] + k_byte_off, 0, 0);
+            a_reg[i] = *reinterpret_cast<float4*>(&raw);
+        }
+        #pragma unroll
+        for (int i = 0; i < B_PER_T; ++i) {
+            __uint128_t raw = llvm_amdgcn_raw_buffer_load_b128(
+                b_srsrc, b_byte_off[i] + k_byte_off, 0, 0);
+            b_reg[i] = *reinterpret_cast<float4*>(&raw);
         }
 
         // Compute all K_SLICES on tic buffer (MFMA overlaps with VMEM loads above)
@@ -162,23 +201,24 @@ void gemm_kernel(const bf16* __restrict__ A,
             }
         }
 
-        // Wait for global loads, write to toc buffer, swap
+        // Wait for buffer_loads, write to shared[toc] via ds_write
         asm volatile("s_waitcnt vmcnt(0)");
-        {
-            float4* da = reinterpret_cast<float4*>(smem_A[toc]);
-            float4* db = reinterpret_cast<float4*>(smem_B[toc]);
-            #pragma unroll
-            for (int i = 0; i < A_PER_T; ++i) {
-                int idx = tid + i * NTHREADS;
-                if (idx < BM * a_f4pr) da[idx] = a_reg[i];
-            }
-            #pragma unroll
-            for (int i = 0; i < B_PER_T; ++i) {
-                int idx = tid + i * NTHREADS;
-                if (idx < BN * b_f4pr) db[idx] = b_reg[i];
-            }
+        #pragma unroll
+        for (int i = 0; i < A_PER_T; ++i) {
+            int idx = tid + i * NTHREADS;
+            uint32_t off = a_lds + toc * SMEM_TILE + idx * 16;
+            store_shared_vec(off, {a_reg[i].x, a_reg[i].y});
+            store_shared_vec(off + 8, {a_reg[i].z, a_reg[i].w});
         }
-        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < B_PER_T; ++i) {
+            int idx = tid + i * NTHREADS;
+            uint32_t off = b_lds + toc * SMEM_TILE + idx * 16;
+            store_shared_vec(off, {b_reg[i].x, b_reg[i].y});
+            store_shared_vec(off + 8, {b_reg[i].z, b_reg[i].w});
+        }
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_barrier();
         tic ^= 1;
         toc ^= 1;
     }
