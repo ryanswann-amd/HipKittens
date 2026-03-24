@@ -131,6 +131,101 @@ def _load(key):
             _loaded[key] = None
     return _loaded[key]
 
+def _load_mod(mod_name):
+    """Load a module by name, with caching."""
+    if mod_name not in _loaded:
+        try:
+            _loaded[mod_name] = importlib.import_module(mod_name)
+        except ImportError:
+            _loaded[mod_name] = None
+    return _loaded[mod_name]
+
+# Rectangular BF16 NT tiles: (block_m, block_n) → module_name
+# Valid dims must be multiples of 64, and block_m + block_n <= 512 (LDS limit)
+_RECT_TILES = {}
+for _bm in [64, 128, 192, 256, 320]:
+    for _bn in [64, 128, 192, 256, 320]:
+        if _bm + _bn > 512: continue
+        if _bm == _bn: continue  # squares handled separately
+        _RECT_TILES[(_bm, _bn)] = f'hk_rect_{_bm}x{_bn}'
+
+_tile_cache = {}  # (dtype, trans, M, N) → (mod, bs)
+
+def _select_tile_best(dtype_key, trans, M, N, K):
+    """Select the best tile by trying ALL valid tiles (square + rectangular).
+
+    For BF16/FP16 NT, benchmarks all valid tiles on first call per shape
+    and caches the winner. Subsequent calls return the cached result.
+    """
+    cache_key = (dtype_key, trans, M, N)
+    if cache_key in _tile_cache:
+        return _tile_cache[cache_key]
+
+    # Collect all valid tiles (square + rectangular)
+    candidates = []
+
+    # Square tiles from registry
+    prefs = _TILE_PREF.get((dtype_key, trans), [128])
+    for bs in prefs:
+        if M % bs == 0 and N % bs == 0 and K % 64 == 0:
+            mod = _load((dtype_key, trans, bs))
+            if mod is not None:
+                candidates.append((mod, bs, bs))
+
+    # Rectangular tiles (BF16/FP16 NT only)
+    if trans == 'nt' and dtype_key in ('bf16', 'fp16') and K % 64 == 0:
+        for (bm, bn), mod_name in _RECT_TILES.items():
+            if M % bm != 0 or N % bn != 0: continue
+            mod = _load_mod(mod_name)
+            if mod is not None:
+                candidates.append((mod, bm, bn))
+
+    if not candidates:
+        return None, 0
+
+    if len(candidates) == 1:
+        result = (candidates[0][0], max(candidates[0][1], candidates[0][2]))
+        _tile_cache[cache_key] = result
+        return result
+
+    # For large shapes with multiple candidates, benchmark to find the best
+    # For small shapes (<512), just use the largest tile (launch overhead dominates)
+    if M * N < 512 * 512:
+        # Pick tile with largest min dimension (best per-tile efficiency)
+        best = max(candidates, key=lambda c: min(c[1], c[2]) * 1000 + max(c[1], c[2]))
+        result = (best[0], max(best[1], best[2]))
+        _tile_cache[cache_key] = result
+        return result
+
+    # Benchmark each candidate with 3 runs
+    import torch
+    best_tf, best_mod, best_bs = 0, None, 0
+    A_test = torch.randn(M, K, device='cuda', dtype=torch.bfloat16 if dtype_key == 'bf16' else torch.float16) / 10
+    B_test = torch.randn(N, K, device='cuda', dtype=torch.bfloat16 if dtype_key == 'bf16' else torch.float16) / 10
+    C_test = torch.zeros(M, N, dtype=A_test.dtype, device='cuda')
+
+    for mod, bm, bn in candidates:
+        try:
+            mod.dispatch(A_test, B_test, C_test)  # warmup
+            torch.cuda.synchronize()
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            s.record()
+            for _ in range(3):
+                mod.dispatch(A_test, B_test, C_test)
+            e.record()
+            torch.cuda.synchronize()
+            tf = 2 * M * N * K / (s.elapsed_time(e) / 3) / 1e9
+            if tf > best_tf:
+                best_tf, best_mod, best_bs = tf, mod, max(bm, bn)
+        except:
+            pass
+
+    del A_test, B_test, C_test
+    result = (best_mod, best_bs) if best_mod else (candidates[0][0], max(candidates[0][1], candidates[0][2]))
+    _tile_cache[cache_key] = result
+    return result
+
 def _dtype_key(t):
     if t.dtype == torch.bfloat16:
         return 'bf16'
@@ -233,8 +328,8 @@ def gemm(A, B, C=None, trans='nt'):
     else:
         c_dtype = torch.bfloat16
 
-    # Try native kernel first
-    mod, bs = _select_tile(dk, trans, M, N, K)
+    # Try native kernel first (includes rect tiles via _select_tile_best)
+    mod, bs = _select_tile_best(dk, trans, M, N, K)
 
     # Fall back to BF16 conversion if no native kernel available
     if mod is None and dk in ('fp32', 'fp8_e4m3', 'fp8_e5m2'):
@@ -242,7 +337,7 @@ def gemm(A, B, C=None, trans='nt'):
         B = B.to(torch.bfloat16)
         dk = 'bf16'
         c_dtype = torch.bfloat16
-        mod, bs = _select_tile(dk, trans, M, N, K)
+        mod, bs = _select_tile_best(dk, trans, M, N, K)
 
     if mod is None:
         raise RuntimeError(f"No kernel for {native_dk} {trans} M={M} N={N} K={K}")
