@@ -50,11 +50,15 @@ class GEMMLibrary:
                 self._kernels[name] = importlib.import_module(mod_name)
             except ImportError as e:
                 print(f"Warning: tile {name} ({mod_name}) not available: {e}")
-        # Load CDNA3 optimized kernel (98% of hipBLASLt for large sizes)
-        try:
-            self._cdna3_kernel = importlib.import_module('hk_gemm')
-        except ImportError:
-            self._cdna3_kernel = None
+        # Load CDNA3 optimized kernels (multiple tile sizes)
+        self._cdna3_kernels = {}
+        for name, mod_name in [('cdna3_128x128', 'hk_128x128'), ('cdna3_256x256', 'hk_256x256')]:
+            try:
+                self._cdna3_kernels[name] = importlib.import_module(mod_name)
+            except ImportError:
+                pass
+        # Legacy single kernel alias
+        self._cdna3_kernel = self._cdna3_kernels.get('cdna3_256x256')
 
     def _build_origami_configs(self):
         """Build origami config_t objects for ranking."""
@@ -158,12 +162,18 @@ class GEMMLibrary:
         if C is None:
             C = torch.zeros(M, N, dtype=torch.bfloat16, device=A.device)
 
-        # Use CDNA3 optimized kernel for large, well-aligned sizes
-        if (self._cdna3_kernel is not None and
-            M >= 4096 and N >= 4096 and
-            M % 256 == 0 and N % 256 == 0 and K % 64 == 0):
-            self._cdna3_kernel.dispatch(A, B, C)
+        # Select best CDNA3 kernel based on problem size
+        # 128x128: best for M,N <= 2048 (higher occupancy)
+        # 256x256: best for M,N >= 4096 (more compute per tile)
+        cdna3_128 = self._cdna3_kernels.get('cdna3_128x128')
+        cdna3_256 = self._cdna3_kernels.get('cdna3_256x256')
+        
+        if cdna3_256 and M >= 4096 and N >= 4096 and M % 256 == 0 and N % 256 == 0 and K % 64 == 0:
+            cdna3_256.dispatch(A, B, C)
+        elif cdna3_128 and M % 128 == 0 and N % 128 == 0 and K % 64 == 0:
+            cdna3_128.dispatch(A, B, C)
         else:
+            # Fallback to C++ kernel with Origami selection
             tile_name, _ = self.select_tile(M, N, K)
             kernel = self._kernels[tile_name]
             kernel.dispatch(A, B, C)

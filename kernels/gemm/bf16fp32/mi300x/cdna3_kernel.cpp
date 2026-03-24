@@ -2,8 +2,14 @@
 #include "pyutils/pyutils.cuh"
 using namespace kittens;
 
-constexpr int BLOCK_SIZE       = 256;
-constexpr int K_STEP           = 64;
+#ifndef BLOCK_SIZE_VAL
+#define BLOCK_SIZE_VAL 256
+#endif
+constexpr int BLOCK_SIZE       = BLOCK_SIZE_VAL;
+#ifndef K_STEP_VAL
+#define K_STEP_VAL 64
+#endif
+constexpr int K_STEP           = K_STEP_VAL;
 constexpr int REG_BLOCK        = BLOCK_SIZE / 4;
 constexpr int DOT_SLICE        = 16;
 
@@ -243,7 +249,10 @@ void dispatch_torch(uint64_t a_ptr, uint64_t b_ptr, uint64_t c_ptr, int Msz, int
     micro_tk<<<dim3((Nsz/BLOCK_SIZE)*(Msz/BLOCK_SIZE)), dim3(NUM_THREADS), mem, (hipStream_t)0>>>(g);
 }
 
-PYBIND11_MODULE(hk_gemm, m) {
+#ifndef HK_MODULE_NAME
+#define HK_MODULE_NAME hk_gemm
+#endif
+PYBIND11_MODULE(HK_MODULE_NAME, m) {
     m.def("dispatch", [](pybind11::object A, pybind11::object B, pybind11::object C) {
         auto sa = A.attr("shape").cast<pybind11::tuple>();
         auto sb = B.attr("shape").cast<pybind11::tuple>();

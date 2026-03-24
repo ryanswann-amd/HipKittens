@@ -81,3 +81,20 @@ hk_gemm$(PY_EXT): cdna3_kernel.cpp
 		$(PY_INCLUDES) $(PY_LDFLAGS) \
 		-Rpass-analysis=kernel-resource-usage \
 		-o $@ 2>&1
+
+# CDNA3 optimized kernels (multiple tile sizes)
+hk_128x128$(PY_EXT): cdna3_kernel.cpp
+	$(HIPCXX) $< $(HIPFLAGS) -std=$(CXX_STD) -w -shared -fPIC \
+		-I$(CDNA3_HEADERS)/include -I$(CDNA3_HEADERS)/prototype \
+		-I$(ROCM_INCLUDE_DIR) -I$(HIP_INCLUDE_DIR) \
+		$(PY_INCLUDES) $(PY_LDFLAGS) \
+		-DBLOCK_SIZE_VAL=128 -DHK_MODULE_NAME=hk_128x128 \
+		-o $@ 2>&1
+
+hk_256x256$(PY_EXT): cdna3_kernel.cpp
+	$(HIPCXX) $< $(HIPFLAGS) -std=$(CXX_STD) -w -shared -fPIC \
+		-I$(CDNA3_HEADERS)/include -I$(CDNA3_HEADERS)/prototype \
+		-I$(ROCM_INCLUDE_DIR) -I$(HIP_INCLUDE_DIR) \
+		$(PY_INCLUDES) $(PY_LDFLAGS) \
+		-DBLOCK_SIZE_VAL=256 -DHK_MODULE_NAME=hk_256x256 \
+		-o $@ 2>&1
