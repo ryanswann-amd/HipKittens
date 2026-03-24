@@ -1,0 +1,4 @@
+# Project: hipkittens | Ticket: HIPKITTENS-0004 | Target: >=470 TF | Direction: higher
+# Mutable: fp8_nn_kernel.cpp|fp8_tt_kernel.cpp|fp8_tn_kernel.cpp
+# Metrics: tflops_4096
+iter	timestamp	metric	prev	delta_pct	status	commit	description
