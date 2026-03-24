@@ -175,6 +175,10 @@ void gemm_kernel(const bf16* __restrict__ A,
             b_reg[i] = *reinterpret_cast<float4*>(&raw);
         }
 
+        // Schedule: issue all VMEM loads first, then allow DS+MFMA
+        __builtin_amdgcn_sched_group_barrier(0x020, A_PER_T + B_PER_T, 0); // VMEM loads
+        __builtin_amdgcn_sched_barrier(0);
+
         // Compute all K_SLICES on tic buffer with sched_group_barrier hints
         {
             const bf16* a_base = smem_A[tic] + a_warp_off;
