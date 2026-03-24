@@ -90,7 +90,11 @@ def _dtype_key(t):
         return 'bf16'
     elif t.dtype == torch.float16:
         return 'fp16'
-    raise ValueError(f"Unsupported dtype {t.dtype}. Use bfloat16 or float16.")
+    elif hasattr(torch, 'float8_e4m3fnuz') and t.dtype == torch.float8_e4m3fnuz:
+        return 'fp8_e4m3'
+    elif hasattr(torch, 'float8_e5m2fnuz') and t.dtype == torch.float8_e5m2fnuz:
+        return 'fp8_e5m2'
+    raise ValueError(f"Unsupported dtype {t.dtype}. Use bfloat16, float16, or float8.")
 
 def _select_tile(dtype_key, trans, M, N, K):
     """Select the best tile size for given problem."""
@@ -106,7 +110,7 @@ def gemm(A, B, C=None, trans='nt'):
     """Run GEMM with auto-selected kernel.
 
     Args:
-        A: Input tensor (dtype must be bfloat16 or float16)
+        A: Input tensor (bfloat16, float16, or float8_e4m3fnuz/e5m2fnuz)
         B: Input tensor (same dtype as A)
         C: Optional output tensor (same dtype, allocated if None)
         trans: 'nt', 'nn', 'tt', or 'tn'
@@ -115,6 +119,13 @@ def gemm(A, B, C=None, trans='nt'):
         C tensor
     """
     dk = _dtype_key(A)
+    out_dtype = A.dtype
+
+    # FP8: convert to BF16 and dispatch via BF16 kernels
+    if dk.startswith('fp8'):
+        A = A.to(torch.bfloat16)
+        B = B.to(torch.bfloat16)
+        dk = 'bf16'
 
     if trans == 'nt':
         M, K = A.shape; N = B.shape[0]
@@ -127,8 +138,10 @@ def gemm(A, B, C=None, trans='nt'):
     else:
         raise ValueError(f"Unknown transpose '{trans}'. Use 'nt', 'nn', 'tt', or 'tn'.")
 
+    # For FP8 inputs, output is always BF16 (the compute dtype)
+    c_dtype = torch.bfloat16 if dk == 'bf16' else (torch.float16 if dk == 'fp16' else torch.bfloat16)
     if C is None:
-        C = torch.zeros(M, N, dtype=A.dtype, device=A.device)
+        C = torch.zeros(M, N, dtype=c_dtype, device=A.device)
 
     mod, bs = _select_tile(dk, trans, M, N, K)
     if mod is None:
