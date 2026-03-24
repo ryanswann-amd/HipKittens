@@ -173,7 +173,7 @@ void gemm_kernel(const bf16* __restrict__ A,
     __builtin_amdgcn_s_barrier();
 
     // === MAIN LOOP ===
-    #pragma unroll 1
+    #pragma unroll 4
     for (int kt = 0; kt < num_k - 1; ++kt) {
         // Issue buffer_load for next K-tile (async VMEM — overlaps with MFMA)
         const int k_byte_off = (kt + 1) * BK * sizeof(bf16);
