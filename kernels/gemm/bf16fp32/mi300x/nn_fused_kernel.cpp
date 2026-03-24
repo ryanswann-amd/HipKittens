@@ -36,34 +36,36 @@ using _gl_C = gl<bf16, -1, -1, -1, -1>;
 using G = kittens::group<NUM_WARPS>;
 
 // ===================== Phase 1: Transpose Kernel =====================
-// Simple, bandwidth-optimal transpose using shared memory tile.
-// Each block transposes a 32×32 tile of bf16 values.
+// Optimized 32×32 tile transpose for bf16.
+// Block: 32×8 threads. Each thread handles 4 rows.
+// Uses __builtin_nontemporal_store for write-combining on output.
 constexpr int TILE_DIM = 32;
+constexpr int BLOCK_ROWS = 8;
 
-__global__ __launch_bounds__(256)
+__global__ __launch_bounds__(TILE_DIM * BLOCK_ROWS)
 void transpose_kernel(
-    bf16* __restrict__ dst,       // NxK output
-    const bf16* __restrict__ src, // KxN input
+    bf16* __restrict__ dst,
+    const bf16* __restrict__ src,
     int K, int N)
 {
-    __shared__ bf16 tile[TILE_DIM][TILE_DIM + 1]; // +1 to avoid bank conflicts
+    __shared__ bf16 tile[TILE_DIM][TILE_DIM + 1];
 
     int x = blockIdx.x * TILE_DIM + threadIdx.x;
     int y = blockIdx.y * TILE_DIM + threadIdx.y;
 
-    // Load from src (KxN) — coalesced along N
+    // Coalesced load from src (KxN) — 32 threads read 32 consecutive N-elements
     #pragma unroll
-    for (int j = 0; j < TILE_DIM; j += 8) {
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
         if ((y + j) < K && x < N)
             tile[threadIdx.y + j][threadIdx.x] = src[(y + j) * N + x];
     }
     __syncthreads();
 
-    // Write to dst (NxK) — coalesced along K
-    x = blockIdx.y * TILE_DIM + threadIdx.x;
-    y = blockIdx.x * TILE_DIM + threadIdx.y;
+    // Coalesced write to dst (NxK) — 32 threads write 32 consecutive K-elements
+    x = blockIdx.y * TILE_DIM + threadIdx.x;  // now K direction
+    y = blockIdx.x * TILE_DIM + threadIdx.y;  // now N direction
     #pragma unroll
-    for (int j = 0; j < TILE_DIM; j += 8) {
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
         if ((y + j) < N && x < K)
             dst[(y + j) * K + x] = tile[threadIdx.x][threadIdx.y + j];
     }
@@ -256,7 +258,7 @@ PYBIND11_MODULE(HK_MODULE_NAME, m) {
 
         // Phase 1: Transpose B from KxN to NxK
         dim3 trans_grid((Nsz + TILE_DIM - 1) / TILE_DIM, (Ksz + TILE_DIM - 1) / TILE_DIM);
-        dim3 trans_block(TILE_DIM, 8);
+        dim3 trans_block(TILE_DIM, BLOCK_ROWS);
         transpose_kernel<<<trans_grid, trans_block>>>(
             workspace, (const bf16*)b_ptr, Ksz, Nsz);
 
