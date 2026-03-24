@@ -218,7 +218,23 @@ hk_tn_fused_256x256x64$(PY_EXT): tn_fused_kernel.cpp
 		-DBLOCK_SIZE_VAL=256 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_tn_fused_256x256x64 \
 		-o $@ 2>&1
 
-fused: hk_nn_fused_256x256x64$(PY_EXT) hk_tt_fused_256x256x64$(PY_EXT) hk_tn_fused_256x256x64$(PY_EXT)
+# Fused 128x128 variants for medium sizes where 128 tile has better parallelism
+hk_nn_fused_128x128x64$(PY_EXT): nn_fused_kernel.cpp
+	$(HIPCXX) $< $(CDNA3_NN_FLAGS) \
+		-DBLOCK_SIZE_VAL=128 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_nn_fused_128x128x64 \
+		-o $@ 2>&1
+
+hk_tt_fused_128x128x64$(PY_EXT): tt_fused_kernel.cpp
+	$(HIPCXX) $< $(CDNA3_NN_FLAGS) \
+		-DBLOCK_SIZE_VAL=128 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_tt_fused_128x128x64 \
+		-o $@ 2>&1
+
+hk_tn_fused_128x128x64$(PY_EXT): tn_fused_kernel.cpp
+	$(HIPCXX) $< $(CDNA3_NN_FLAGS) \
+		-DBLOCK_SIZE_VAL=128 -DK_STEP_VAL=64 -DHK_MODULE_NAME=hk_tn_fused_128x128x64 \
+		-o $@ 2>&1
+
+fused: hk_nn_fused_256x256x64$(PY_EXT) hk_tt_fused_256x256x64$(PY_EXT) hk_tn_fused_256x256x64$(PY_EXT) hk_nn_fused_128x128x64$(PY_EXT) hk_tt_fused_128x128x64$(PY_EXT) hk_tn_fused_128x128x64$(PY_EXT)
 
 # FP16 fused kernels
 hk_fp16_nn_fused_256x256x64$(PY_EXT): fp16_nn_fused_kernel.cpp

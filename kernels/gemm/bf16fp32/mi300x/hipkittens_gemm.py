@@ -39,15 +39,15 @@ _KERNELS = {
     ('bf16', 'nt', 256): 'hk_256x256',
     ('bf16', 'nt', 192): 'hk_192x192x64',
     ('bf16', 'nt', 128): 'hk_128x128x64',
-    # BF16 NN (fused transpose+NT for 256x256 at large sizes)
+    # BF16 NN
     ('bf16', 'nn', 256): 'hk_nn_fused_256x256x64',
     ('bf16', 'nn', 192): 'hk_nn_192x192x64',
     ('bf16', 'nn', 128): 'hk_nn_128x128x64',
-    # BF16 TT (fused for 256x256 at large sizes)
+    # BF16 TT
     ('bf16', 'tt', 256): 'hk_tt_fused_256x256x64',
     ('bf16', 'tt', 192): 'hk_tt_192x192x64',
     ('bf16', 'tt', 128): 'hk_tt_128x128x64',
-    # BF16 TN (fused for 256x256 at large sizes)
+    # BF16 TN
     ('bf16', 'tn', 256): 'hk_tn_fused_256x256x64',
     ('bf16', 'tn', 192): 'hk_tn_192x192x64',
     ('bf16', 'tn', 128): 'hk_tn_128x128x64',
@@ -107,7 +107,14 @@ def _dtype_key(t):
     raise ValueError(f"Unsupported dtype {t.dtype}. Use float32, bfloat16, float16, or float8.")
 
 def _select_tile(dtype_key, trans, M, N, K):
-    """Select the best tile size for given problem using Origami if available."""
+    """Select the best tile size for given problem using Origami if available.
+
+    For transpose variants (NN/TT/TN), uses a compute-intensity heuristic
+    to decide between in-kernel transpose and fused (transpose kernel + NT):
+    - Small problems (low FLOPS): in-kernel (avoids kernel launch overhead)
+    - Medium problems: fused 128 (transpose + high-occupancy NT 128x128)
+    - Large problems: fused 256 (transpose + max-efficiency NT 256x256)
+    """
     prefs = _TILE_PREF.get((dtype_key, trans), [128])
 
     # Filter to tiles that divide M, N, K
