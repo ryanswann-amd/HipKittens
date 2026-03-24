@@ -2,3 +2,4 @@
 # Mutable: fp8_nn_kernel.cpp|fp8_tt_kernel.cpp|fp8_tn_kernel.cpp
 # Metrics: tflops_4096
 iter	timestamp	metric	prev	delta_pct	status	commit	description
+0	2026-03-24T17:17:43+00:00	355.7	-	-	BASELINE	b09ee8d6	Initial baseline: FP8 NN in-kernel BS=128 124VGPRs occ4
