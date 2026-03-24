@@ -94,7 +94,9 @@ def _dtype_key(t):
         return 'fp8_e4m3'
     elif hasattr(torch, 'float8_e5m2fnuz') and t.dtype == torch.float8_e5m2fnuz:
         return 'fp8_e5m2'
-    raise ValueError(f"Unsupported dtype {t.dtype}. Use bfloat16, float16, or float8.")
+    elif t.dtype == torch.float32:
+        return 'fp32'
+    raise ValueError(f"Unsupported dtype {t.dtype}. Use float32, bfloat16, float16, or float8.")
 
 def _select_tile(dtype_key, trans, M, N, K):
     """Select the best tile size for given problem."""
@@ -121,8 +123,8 @@ def gemm(A, B, C=None, trans='nt'):
     dk = _dtype_key(A)
     out_dtype = A.dtype
 
-    # FP8: convert to BF16 and dispatch via BF16 kernels
-    if dk.startswith('fp8'):
+    # FP8/FP32: convert to BF16 and dispatch via BF16 kernels
+    if dk.startswith('fp8') or dk == 'fp32':
         A = A.to(torch.bfloat16)
         B = B.to(torch.bfloat16)
         dk = 'bf16'
