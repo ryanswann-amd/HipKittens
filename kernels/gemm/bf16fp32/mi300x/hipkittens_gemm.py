@@ -157,10 +157,19 @@ def _select_tile_best(dtype_key, trans, M, N, K):
     Collects all valid tiles (square + rectangular), passes them to
     Origami's select_config, and returns the winner. Falls back to
     largest valid tile if Origami is unavailable.
+
+    BF16 NT kernels support in-kernel boundary handling (SRD OOB returns 0),
+    so tiles don't need to divide M/N evenly. Other dtype/trans combos still
+    require exact divisibility.
     """
     cache_key = (dtype_key, trans, M, N)
     if cache_key in _tile_cache:
         return _tile_cache[cache_key]
+
+    # BF16 NT square tiles (BS <= 256, from cdna3_kernel.cpp) have SRD-based
+    # boundary handling — they work on any shape without M/N divisibility.
+    # Rect tiles (rect_kernel.cpp) and BS > 256 do NOT have the SRD fix.
+    boundary_safe_square = (dtype_key == 'bf16' and trans == 'nt')
 
     # Collect all valid tiles (square + rectangular)
     candidates = []
@@ -168,12 +177,14 @@ def _select_tile_best(dtype_key, trans, M, N, K):
     # Square tiles from registry
     prefs = _TILE_PREF.get((dtype_key, trans), [128])
     for bs in prefs:
-        if M % bs == 0 and N % bs == 0 and K % 64 == 0:
+        if K % 64 != 0:
+            continue
+        if (boundary_safe_square and bs <= 256) or (M % bs == 0 and N % bs == 0):
             mod = _load((dtype_key, trans, bs))
             if mod is not None:
                 candidates.append((mod, bs, bs))
 
-    # Rectangular tiles (BF16/FP16 NT only)
+    # Rectangular tiles (BF16/FP16 NT only) — require exact divisibility
     if trans == 'nt' and dtype_key in ('bf16', 'fp16') and K % 64 == 0:
         for (bm, bn), mod_name in _RECT_TILES.items():
             if M % bm != 0 or N % bn != 0: continue
@@ -189,38 +200,46 @@ def _select_tile_best(dtype_key, trans, M, N, K):
         _tile_cache[cache_key] = result
         return result
 
-    # Use Origami to select the best tile
-    if _USE_ORIGAMI:
-        try:
-            problem = origami.problem_t()
-            problem.size = origami.dim3_t(M, N, K)
-            problem.a_dtype = origami.data_type_t.BFloat16
-            problem.b_dtype = origami.data_type_t.BFloat16
-            problem.c_dtype = origami.data_type_t.Float
-            problem.d_dtype = origami.data_type_t.Float
+    # Select the best tile based on GPU saturation on MI300X (304 CUs).
+    # Larger tiles have higher per-tile throughput (256 > 192 > 128) but need
+    # more workgroups to fill the GPU. Pick the largest tile that generates
+    # enough blocks to keep most CUs busy.
+    # Empirically calibrated saturation thresholds:
+    #   256: >= 200 blocks (65% of 304 CUs at 1 WG/CU)
+    #   192: >= 140 blocks (46% — lower because 192 has same occ as 256)
+    #   128: always valid (2 WGs/CU, only 76 blocks needed)
+    _SAT = {256: 200, 192: 140, 128: 76}
+    def _ceil_div(a, b): return (a + b - 1) // b
 
-            configs = []
-            for mod, bm, bn in candidates:
-                c = origami.config_t()
-                c.mt = origami.dim3_t(bm, bn, 64)
-                c.mi = origami.dim3_t(16, 16, 16)
-                configs.append((mod, bm, bn, c))
+    # Sort candidates: square tiles by size (largest first), then rect tiles
+    squares = [(mod, bm, bn) for mod, bm, bn in candidates if bm == bn]
+    rects = [(mod, bm, bn) for mod, bm, bn in candidates if bm != bn]
+    squares.sort(key=lambda x: -x[1])
 
-            oc = [c for _, _, _, c in configs]
-            result_cfg = origami.select_config(problem, _origami_hw, oc)
-            best_bm = result_cfg.config.mt.m
-            best_bn = result_cfg.config.mt.n
+    # Check square tiles first (higher efficiency than rect)
+    for mod, bm, bn in squares:
+        blocks = _ceil_div(M, bm) * _ceil_div(N, bn)
+        threshold = _SAT.get(bm, 200)
+        if blocks >= threshold:
+            result = (mod, bm)
+            _tile_cache[cache_key] = result
+            return result
 
-            for mod, bm, bn, _ in configs:
-                if bm == best_bm and bn == best_bn:
-                    result = (mod, max(bm, bn))
-                    _tile_cache[cache_key] = result
-                    return result
-        except:
-            pass  # fall through to fallback
+    # Check rect tiles
+    rects.sort(key=lambda x: -(x[1] * x[2]))
+    for mod, bm, bn in rects:
+        blocks = _ceil_div(M, bm) * _ceil_div(N, bn)
+        if blocks >= 200:
+            result = (mod, max(bm, bn))
+            _tile_cache[cache_key] = result
+            return result
 
-    # Fallback: first valid tile (largest)
-    result = (candidates[0][0], max(candidates[0][1], candidates[0][2]))
+    # Fallback: smallest square tile (most blocks)
+    if squares:
+        result = (squares[-1][0], squares[-1][1])
+        _tile_cache[cache_key] = result
+        return result
+    result = (candidates[-1][0], max(candidates[-1][1], candidates[-1][2]))
     _tile_cache[cache_key] = result
     return result
 

@@ -29,11 +29,72 @@ struct micro_globals {
     _gl_B b;
     _gl_C c;
     int M_dim, N_dim, K_dim;
+    int a_total_bytes, b_total_bytes;  // actual buffer sizes for OOB-safe loads
     hipStream_t stream;
     dim3 grid()  { return dim3(ceil_div(N_dim, BLOCK_SIZE) * ceil_div(M_dim, BLOCK_SIZE)); }
     dim3 block() { return dim3(NUM_THREADS); }
     size_t dynamic_shared_memory() { return 65536; }
 };
+
+// Bounded buffer-load: like load_global_to_register_buffer but the SRD range is
+// clamped to the actual buffer extent so OOB rows silently return 0 (hardware
+// guarantee on CDNA buffer_load).  This lets boundary tiles read a full
+// BLOCK_SIZE tile from unpadded input without workspace copies.
+template<int axis=2, bool assume_aligned=false,
+        int N_THREADS_T = WARP_THREADS,
+        ducks::st::all ST,
+        ducks::gl::all GL,
+        ducks::coord::tile COORD = coord<ST>
+>
+__device__ inline void bounded_load_global_to_register_buffer(
+        float4* reg_buffer, const int buffer_size,
+        const GL& src, const COORD& idx, const ST& dst_template,
+        int buf_total_bytes)  // actual buffer size in bytes
+{
+    using T = typename ST::dtype;
+    constexpr int elem_per_memcpy = sizeof(float4)/sizeof(T);
+    constexpr int memcpy_per_row = ST::cols / elem_per_memcpy;
+    constexpr int total_chunks = (ST::rows * ST::cols) / elem_per_memcpy;
+    constexpr int total_calls = (total_chunks + N_THREADS_T - 1) / N_THREADS_T;
+    constexpr int small_calls = 16;
+    const int big_calls = (total_calls + small_calls - 1) / small_calls;
+
+    const int row_stride = src.template stride<axis>();
+    const int row_stride_bytes = row_stride * sizeof(T);
+    coord<> unit_coord = idx.template unit_coord<axis, 3>();
+    T* base_ptr = (T*)&src[unit_coord];
+
+    // Compute how many bytes are available from base_ptr to end of buffer
+    T* buf_start = src.raw_ptr;
+    int offset_bytes = (int)((char*)base_ptr - (char*)buf_start);
+    int avail_bytes = buf_total_bytes - offset_bytes;
+    if (avail_bytes < 0) avail_bytes = 0;
+
+    // Clamp SRD range to available bytes so OOB reads return 0
+    const int full_tile_bytes = row_stride * ST::rows * sizeof(T);
+    int srd_range = (avail_bytes < full_tile_bytes) ? avail_bytes : full_tile_bytes;
+
+    const int laneid = threadIdx.x % N_THREADS_T;
+    i32x4 srsrc = make_srsrc(base_ptr, srd_range, row_stride_bytes);
+
+    int buf_idx = 0;
+    for (int i = 0; i < big_calls && buf_idx < buffer_size; ++i) {
+        const int offset = i * small_calls;
+        #pragma unroll
+        for (int j = 0; j < small_calls; ++j) {
+            const int chunk_idx = (offset + j) * N_THREADS_T + laneid;
+            if (chunk_idx < total_chunks && buf_idx < buffer_size) {
+                int row = chunk_idx / memcpy_per_row;
+                int col = (chunk_idx % memcpy_per_row) * elem_per_memcpy;
+                int flat_offset = row * row_stride + col;
+                int byte_offset = flat_offset * sizeof(T);
+                __uint128_t raw = llvm_amdgcn_raw_buffer_load_b128(srsrc, byte_offset, 0, 0);
+                reg_buffer[buf_idx] = *reinterpret_cast<float4*>(&raw);
+                buf_idx++;
+            }
+        }
+    }
+}
 
 __global__ __launch_bounds__(NUM_THREADS, 2)
 void micro_tk(const micro_globals g) {
@@ -75,9 +136,21 @@ void micro_tk(const micro_globals g) {
 
     const int num_tiles = ceil_div(g.K_dim, K_STEP);
 
-    // Load first tile into shared memory
-    G::load(As, g.a, {0, 0, row, 0});
-    G::load(Bs, g.b, {0, 0, col, 0});
+    // Load first tile into shared memory using bounded buffer loads.
+    // This replaces G::load (which uses flat global_load_dwordx4 that faults on OOB)
+    // with buffer_load via SRD that returns 0 for OOB — no workspace copy needed.
+    {
+        constexpr int BUFFER_SIZE = (BLOCK_SIZE * K_STEP) / NUM_THREADS;
+        float4 a_buf0[BUFFER_SIZE * sizeof(bf16) / sizeof(float4)];
+        float4 b_buf0[BUFFER_SIZE * sizeof(bf16) / sizeof(float4)];
+        bounded_load_global_to_register_buffer<2, false, NUM_THREADS>(
+            a_buf0, BUFFER_SIZE, g.a, {0, 0, row, 0}, As, g.a_total_bytes);
+        bounded_load_global_to_register_buffer<2, false, NUM_THREADS>(
+            b_buf0, BUFFER_SIZE, g.b, {0, 0, col, 0}, Bs, g.b_total_bytes);
+        asm volatile("s_waitcnt vmcnt(0)");
+        store_register_buffer_to_shared<NUM_THREADS>(As, a_buf0);
+        store_register_buffer_to_shared<NUM_THREADS>(Bs, b_buf0);
+    }
     __builtin_amdgcn_s_barrier();
 
     if (warp_row == 1) {
@@ -94,7 +167,7 @@ void micro_tk(const micro_globals g) {
         float4 b_buffer_next[BUFFER_SIZE * sizeof(bf16) / sizeof(float4)];
 
         // Cluster 0
-        load_global_to_register_buffer<2, false, NUM_THREADS>(a_buffer_next, BUFFER_SIZE, g.a, {0, 0, row, tile + 1}, As);
+        bounded_load_global_to_register_buffer<2, false, NUM_THREADS>(a_buffer_next, BUFFER_SIZE, g.a, {0, 0, row, tile + 1}, As, g.a_total_bytes);
         load(tiles[1], subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row, 0}));
         load(tiles[2], subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row + 2, 0}));
         load(tiles[0], subtile_inplace<REG_BLOCK, DOT_SLICE>(Bs, {warp_col, 0}));
@@ -129,7 +202,7 @@ void micro_tk(const micro_globals g) {
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 4
-        load_global_to_register_buffer<2, false, NUM_THREADS>(b_buffer_next, BUFFER_SIZE, g.b, {0, 0, col, tile + 1}, Bs);
+        bounded_load_global_to_register_buffer<2, false, NUM_THREADS>(b_buffer_next, BUFFER_SIZE, g.b, {0, 0, col, tile + 1}, Bs, g.b_total_bytes);
         load(tiles[2], subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row + 2, 2}));
         load(tiles[6], subtile_inplace<REG_BLOCK, DOT_SLICE>(Bs, {warp_col, 3}));
         load(tiles[7], subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row, 3}));
@@ -282,51 +355,26 @@ void dispatch_micro(micro_globals g) {
 
 
 void dispatch_torch(uint64_t a_ptr, uint64_t b_ptr, uint64_t c_ptr, int Msz, int Nsz, int Ksz) {
-    // For aligned shapes: direct dispatch (zero overhead)
-    // For non-aligned: pad with static workspace, copy data + zero padding rows only
+    // Zero-copy boundary handling: the kernel uses bounded buffer_load (SRD) which
+    // returns 0 for OOB accesses.  No workspace, no hipMemcpy, no hipMemset.
+    // We tell the gl about padded dimensions so tile indexing works, but pass the
+    // actual buffer byte sizes so the SRD range clamps correctly.
     int padM = ((Msz + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
     int padN = ((Nsz + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
-    bool need_pad_m = (padM != Msz);
-    bool need_pad_n = (padN != Nsz);
-    // K is always 64-aligned for our shapes (multiples of 128), but handle edge case
     int Kuse = Ksz;
 
-    uint64_t a_use = a_ptr, b_use = b_ptr;
-
-    if (need_pad_m || need_pad_n) {
-        static bf16 *ws_a = nullptr, *ws_b = nullptr;
-        static size_t ws_a_sz = 0, ws_b_sz = 0;
-
-        if (need_pad_m) {
-            size_t need = (size_t)padM * Kuse * sizeof(bf16);
-            if (need > ws_a_sz) { if (ws_a) hipFree(ws_a); hipMalloc(&ws_a, need); ws_a_sz = need; }
-            // Copy original rows (contiguous since stride = Kuse for both)
-            hipMemcpyAsync(ws_a, (void*)a_ptr, (size_t)Msz * Kuse * sizeof(bf16),
-                          hipMemcpyDeviceToDevice, (hipStream_t)0);
-            // Zero only the padding rows (not the whole buffer)
-            if (padM > Msz)
-                hipMemsetAsync(ws_a + (size_t)Msz * Kuse, 0,
-                              (size_t)(padM - Msz) * Kuse * sizeof(bf16), (hipStream_t)0);
-            a_use = (uint64_t)ws_a;
-        }
-
-        if (need_pad_n) {
-            size_t need = (size_t)padN * Kuse * sizeof(bf16);
-            if (need > ws_b_sz) { if (ws_b) hipFree(ws_b); hipMalloc(&ws_b, need); ws_b_sz = need; }
-            hipMemcpyAsync(ws_b, (void*)b_ptr, (size_t)Nsz * Kuse * sizeof(bf16),
-                          hipMemcpyDeviceToDevice, (hipStream_t)0);
-            if (padN > Nsz)
-                hipMemsetAsync(ws_b + (size_t)Nsz * Kuse, 0,
-                              (size_t)(padN - Nsz) * Kuse * sizeof(bf16), (hipStream_t)0);
-            b_use = (uint64_t)ws_b;
-        }
-    }
-
-    auto ga = kittens::make_gl<_gl_A>(a_use, 1, 1, padM, Kuse);
-    auto gb = kittens::make_gl<_gl_B>(b_use, 1, 1, padN, Kuse);
+    // gl with padded row count but original pointer — stride (cols = Kuse) is
+    // the same whether rows = Msz or padM, so address arithmetic is correct
+    // for valid rows.  Boundary rows fall outside a_total_bytes and the SRD
+    // returns 0.
+    auto ga = kittens::make_gl<_gl_A>(a_ptr, 1, 1, padM, Kuse);
+    auto gb = kittens::make_gl<_gl_B>(b_ptr, 1, 1, padN, Kuse);
     auto gc = kittens::make_gl<_gl_C>(c_ptr, 1, 1, Msz, Nsz);
 
-    micro_globals g{ga, gb, gc, Msz, Nsz, Kuse, (hipStream_t)0};
+    int a_bytes = (int)((size_t)Msz * Kuse * sizeof(bf16));
+    int b_bytes = (int)((size_t)Nsz * Kuse * sizeof(bf16));
+
+    micro_globals g{ga, gb, gc, Msz, Nsz, Kuse, a_bytes, b_bytes, (hipStream_t)0};
     unsigned long mem = 65536;
     hipFuncSetAttribute((void*)micro_tk, hipFuncAttributeMaxDynamicSharedMemorySize, mem);
     micro_tk<<<dim3(ceil_div(Nsz,BLOCK_SIZE)*ceil_div(Msz,BLOCK_SIZE)), dim3(NUM_THREADS), mem, (hipStream_t)0>>>(g);
