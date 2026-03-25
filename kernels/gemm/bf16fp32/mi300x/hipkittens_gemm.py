@@ -200,46 +200,51 @@ def _select_tile_best(dtype_key, trans, M, N, K):
         _tile_cache[cache_key] = result
         return result
 
-    # Select the best tile based on GPU saturation on MI300X (304 CUs).
-    # Larger tiles have higher per-tile throughput (256 > 192 > 128) but need
-    # more workgroups to fill the GPU. Pick the largest tile that generates
-    # enough blocks to keep most CUs busy.
-    # Empirically calibrated saturation thresholds:
-    #   256: >= 200 blocks (65% of 304 CUs at 1 WG/CU)
-    #   192: >= 140 blocks (46% — lower because 192 has same occ as 256)
-    #   128: always valid (2 WGs/CU, only 76 blocks needed)
-    _SAT = {256: 200, 192: 140, 128: 76}
+    # Tile selection for MI300X (304 CUs, 1 WG/CU for BS>=192, 2 for BS=128).
+    # Score = peak_throughput * pass_aware_utilization * boundary_efficiency
+    # Pass-aware utilization: when blocks > CU_slots, GPU needs multiple passes.
+    # Going from 304→305 blocks doubles time for 0.3% more work.
+    _PEAK = {256: 580, 192: 540, 128: 420}
+    _N_CU = 304
     def _ceil_div(a, b): return (a + b - 1) // b
 
-    # Sort candidates: square tiles by size (largest first), then rect tiles
-    squares = [(mod, bm, bn) for mod, bm, bn in candidates if bm == bn]
+    squares = [(mod, bm) for mod, bm, bn in candidates if bm == bn]
     rects = [(mod, bm, bn) for mod, bm, bn in candidates if bm != bn]
-    squares.sort(key=lambda x: -x[1])
 
-    # Check square tiles first (higher efficiency than rect)
-    for mod, bm, bn in squares:
-        blocks = _ceil_div(M, bm) * _ceil_div(N, bn)
-        threshold = _SAT.get(bm, 200)
-        if blocks >= threshold:
-            result = (mod, bm)
-            _tile_cache[cache_key] = result
-            return result
+    best_mod, best_bs, best_score = None, 0, -1.0
+    for mod, bs in squares:
+        peak = _PEAK.get(bs, 420)
+        blocks = _ceil_div(M, bs) * _ceil_div(N, bs)
+        cu_slots = _N_CU * (2 if bs <= 128 else 1)
+        passes = _ceil_div(blocks, cu_slots)
+        util = blocks / (passes * cu_slots)
+        padM = _ceil_div(M, bs) * bs
+        padN = _ceil_div(N, bs) * bs
+        eff = (M * N) / (padM * padN) if padM * padN > 0 else 1.0
+        score = peak * util * eff
+        if score > best_score:
+            best_score = score
+            best_mod, best_bs = mod, bs
 
-    # Check rect tiles
-    rects.sort(key=lambda x: -(x[1] * x[2]))
-    for mod, bm, bn in rects:
-        blocks = _ceil_div(M, bm) * _ceil_div(N, bn)
-        if blocks >= 200:
-            result = (mod, max(bm, bn))
-            _tile_cache[cache_key] = result
-            return result
+    # Rect tiles as fallback only
+    if best_mod is None:
+        rects.sort(key=lambda x: -(x[1] * x[2]))
+        for mod, bm, bn in rects:
+            if M % bm == 0 and N % bn == 0:
+                blocks = (M // bm) * (N // bn)
+                if blocks >= 100:
+                    best_mod, best_bs = mod, max(bm, bn)
+                    break
 
-    # Fallback: smallest square tile (most blocks)
-    if squares:
-        result = (squares[-1][0], squares[-1][1])
+    if best_mod:
+        result = (best_mod, best_bs)
         _tile_cache[cache_key] = result
         return result
-    result = (candidates[-1][0], max(candidates[-1][1], candidates[-1][2]))
+
+    if squares:
+        result = (squares[-1][0], squares[-1][1])
+    else:
+        result = (candidates[-1][0], max(candidates[-1][1], candidates[-1][2]))
     _tile_cache[cache_key] = result
     return result
 
