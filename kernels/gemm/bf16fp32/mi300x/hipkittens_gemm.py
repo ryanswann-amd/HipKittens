@@ -152,24 +152,15 @@ for _bm in [64, 128, 192, 256, 320]:
 _tile_cache = {}  # (dtype, trans, M, N) → (mod, bs)
 
 def _select_tile_best(dtype_key, trans, M, N, K):
-    """Select the best tile by trying ALL valid tiles (square + rectangular).
+    """Select the best tile using Origami analytical model.
 
-    For BF16/FP16 NT, benchmarks all valid tiles on first call per shape
-    and caches the winner. Subsequent calls return the cached result.
+    Collects all valid tiles (square + rectangular), passes them to
+    Origami's select_config, and returns the winner. Falls back to
+    largest valid tile if Origami is unavailable.
     """
     cache_key = (dtype_key, trans, M, N)
     if cache_key in _tile_cache:
         return _tile_cache[cache_key]
-
-    # Fast path: if 256 tile is valid AND shape is large enough, use it directly.
-    # The 256 tile is empirically best for large shapes (>= 2048 in both dims).
-    # Skip auto-tuning to avoid noisy benchmark artifacts.
-    if M % 256 == 0 and N % 256 == 0 and K % 64 == 0 and M >= 2048 and N >= 2048:
-        mod_256 = _load((dtype_key, trans, 256))
-        if mod_256 is not None:
-            result = (mod_256, 256)
-            _tile_cache[cache_key] = result
-            return result
 
     # Collect all valid tiles (square + rectangular)
     candidates = []
@@ -198,53 +189,38 @@ def _select_tile_best(dtype_key, trans, M, N, K):
         _tile_cache[cache_key] = result
         return result
 
-    # For small/medium shapes, use heuristic instead of noisy benchmark.
-    # Primary: maximize WGs for GPU saturation (critical for small shapes).
-    # Secondary: prefer larger min(bm,bn) for better per-tile efficiency.
-    # Constraint: need at least ~48 WGs for reasonable GPU utilization.
-    if M * N < 2048 * 2048:
-        best_score, best_mod, best_bs = 0, None, 0
-        for mod, bm, bn in candidates:
-            wgs = (M // bm) * (N // bn)
-            min_dim = min(bm, bn)
-            # Score: WGs dominates, min_dim is tiebreaker
-            score = min(wgs, 608) * 10000 + min_dim
-            if score > best_score:
-                best_score = score
-                best_mod, best_bs = mod, max(bm, bn)
-        if best_mod:
-            result = (best_mod, best_bs)
-            _tile_cache[cache_key] = result
-            return result
-
-    # Benchmark each candidate: 2 warmup + 5 timed runs for stable results
-    import torch
-    best_tf, best_mod, best_bs = 0, None, 0
-    dt = torch.bfloat16 if dtype_key == 'bf16' else torch.float16
-    A_test = torch.randn(M, K, device='cuda', dtype=dt) / 10
-    B_test = torch.randn(N, K, device='cuda', dtype=dt) / 10
-    C_test = torch.zeros(M, N, dtype=A_test.dtype, device='cuda')
-
-    for mod, bm, bn in candidates:
+    # Use Origami to select the best tile
+    if _USE_ORIGAMI:
         try:
-            # 2 warmup runs
-            for _ in range(2): mod.dispatch(A_test, B_test, C_test)
-            torch.cuda.synchronize()
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            for _ in range(5):
-                mod.dispatch(A_test, B_test, C_test)
-            e.record()
-            torch.cuda.synchronize()
-            tf = 2 * M * N * K / (s.elapsed_time(e) / 5) / 1e9
-            if tf > best_tf:
-                best_tf, best_mod, best_bs = tf, mod, max(bm, bn)
-        except:
-            pass
+            problem = origami.problem_t()
+            problem.size = origami.dim3_t(M, N, K)
+            problem.a_dtype = origami.data_type_t.BFloat16
+            problem.b_dtype = origami.data_type_t.BFloat16
+            problem.c_dtype = origami.data_type_t.Float
+            problem.d_dtype = origami.data_type_t.Float
 
-    del A_test, B_test, C_test
-    result = (best_mod, best_bs) if best_mod else (candidates[0][0], max(candidates[0][1], candidates[0][2]))
+            configs = []
+            for mod, bm, bn in candidates:
+                c = origami.config_t()
+                c.mt = origami.dim3_t(bm, bn, 64)
+                c.mi = origami.dim3_t(16, 16, 16)
+                configs.append((mod, bm, bn, c))
+
+            oc = [c for _, _, _, c in configs]
+            result_cfg = origami.select_config(problem, _origami_hw, oc)
+            best_bm = result_cfg.config.mt.m
+            best_bn = result_cfg.config.mt.n
+
+            for mod, bm, bn, _ in configs:
+                if bm == best_bm and bn == best_bn:
+                    result = (mod, max(bm, bn))
+                    _tile_cache[cache_key] = result
+                    return result
+        except:
+            pass  # fall through to fallback
+
+    # Fallback: first valid tile (largest)
+    result = (candidates[0][0], max(candidates[0][1], candidates[0][2]))
     _tile_cache[cache_key] = result
     return result
 
