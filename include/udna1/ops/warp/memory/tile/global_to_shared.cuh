@@ -7,6 +7,7 @@
 
 #include "../../../../common/common.cuh"
 #include "../../../../types/types.cuh"
+#include "tdm_descriptor.cuh"
 
 namespace kittens {
 
@@ -279,162 +280,145 @@ __device__ inline void load_async(st<T, ROWS, COLS, Shape>& dst, const GL& src,
  * @param  cluster_mask Optional `workgroup_mask` (0 for single-WG, non-zero
  *                     to switch the load into `CLUSTER_LOAD_ASYNC` micro-ops).
  */
+/**
+ * @brief Optional knobs for the derived-by-default `load_tdm` / `store_tdm`.
+ *
+ * Everything the `st` + `gl` already encode (dtype, tile dims, padding, LDS
+ * address, tensor extents, dense stride, global base) is derived, never passed.
+ * Only the genuinely optional behavior lives here. Designated initializers keep
+ * the common call short: `load_tdm(dst, src, idx, {.arrive = &bar})`.
+ */
+struct tdm_opts {
+    uint64_t*         arrive  = nullptr;                  // !=0 => atomic_barrier_enable + LDS bar addr; else poll via wait_tdm
+    uint32_t          cluster = 0;                        // multicast mask (load only)
+    detail::idx_width idx_w   = detail::idx_width::b16;   // gather index width (reserved; gather is not yet implemented)
+};
+
 namespace detail {
 
-using v4u32 = unsigned int __attribute__((ext_vector_type(4)));
-using v8u32 = unsigned int __attribute__((ext_vector_type(8)));
-
 /**
- * @brief Build the 12-DWord TDM D# (groups 0 + 1) for a 2D tile transfer.
+ * @brief Build a dense affine load descriptor and issue the TDM load builtin.
  *
- * Encapsulates the bit-packing shared by `load_tdm` and `load_tdm_arrive`.
- * The LDS padding fields are read from the tile shape (`Shape::pad_interval`
- * / `Shape::pad_amount`). `bar_lds_addr` is the LDS byte address of a
- * `barrier_lds` cell when the caller wants the TDM unit to auto-arrive at
- * completion (sets the `atomic_barrier_enable` bit and stuffs the address
- * into group 1). Pass 0 for the no-barrier path.
+ * Shared lowering used by both the derived `load_tdm` verb and the deprecated
+ * explicit-extent shims. Reuses the proven groups-0/1 packing; groups 2/3 are
+ * zero (dense affine). `bar_lds_addr == 0` means ordering-only (poll with
+ * `wait_tdm`); non-zero sets the D# auto-arrive.
  */
 template<typename Shape, int ROWS, int COLS, typename T>
-__device__ __forceinline__ void build_tdm_descriptor_2d(
-    v4u32& g0, v8u32& g1,
-    const T* base, T* lds_dst,
+__device__ __forceinline__ void issue_tdm_load(
+    st<T, ROWS, COLS, Shape>& dst, const T* base,
     int tensor_rows, int tensor_cols, int row_stride,
     uint32_t cluster_mask, uint32_t bar_lds_addr)
 {
-    // ---- Group 0: count, lds_addr, global_addr, type ----
-    const uint32_t lds_addr = static_cast<uint32_t>(
-        reinterpret_cast<uintptr_t>(lds_dst));
-    const uint64_t gaddr    = reinterpret_cast<uint64_t>(base);
+    tdm_desc d;
+    d.base         = reinterpret_cast<uint64_t>(base);
+    d.lds_addr     = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(dst.data));
+    d.tensor_rows  = static_cast<uint32_t>(tensor_rows);
+    d.tensor_cols  = static_cast<uint32_t>(tensor_cols);
+    d.row_stride_e = static_cast<uint32_t>(row_stride);
+    d.cluster_mask = static_cast<uint16_t>(cluster_mask);
+    d.bar_lds_addr = static_cast<uint16_t>(bar_lds_addr);
+    d.mode         = tdm_mode::affine;
+    d.dir          = tdm_dir::load;
 
-    g0[0] = 1u;                                                  // count
-    g0[1] = lds_addr;
-    g0[2] = static_cast<uint32_t>(gaddr);
-    g0[3] = (static_cast<uint32_t>(gaddr >> 32) & 0x01FFFFFFu) | (2u << 30);
+    v4u32 g0, g2, g3;
+    v8u32 g1;
+    encode_tdm<Shape, ROWS, COLS, T>(d, g0, g1, g2, g3);
+    __builtin_amdgcn_tensor_load_to_lds(g0, g1, g2, g3, 0);
+}
 
-    // ---- Group 1: data_size, padding, dims, stride, optional barrier ----
-    // data_size encoded as log2(bytes_per_element).
-    constexpr uint32_t data_size_enc = (sizeof(T) == 1) ? 0
-                                     : (sizeof(T) == 2) ? 1
-                                     : (sizeof(T) == 4) ? 2
-                                     : 3;
-    constexpr uint32_t pad_enable   = (Shape::pad_interval > 0) ? 1u : 0u;
-    constexpr uint32_t pad_int_enc  = (Shape::pad_interval > 0)
-        ? ( __builtin_ctz(Shape::pad_interval * sizeof(T) / 4) ) : 0;
-    constexpr uint32_t pad_amt_enc  = (Shape::pad_amount > 0)
-        ? ( (Shape::pad_amount * sizeof(T) / 4) - 1 ) : 0;
-
-    // atomic_barrier_enable lives at bit 18 of group 1 word 0
-    // (per the MI400 TDM D# layout: w0 = multicast_mask[15:0],
-    // data_size[17:16], atomic_barrier_enable[18], iterate_enable[19],
-    // pad_enable[20], pad_interval[24:22], pad_amount[31:25]).
-    const uint32_t atomic_bar_enable = (bar_lds_addr != 0) ? (1u << 18) : 0u;
-
-    uint32_t w0 = (data_size_enc << 16)
-                | (pad_enable    << 20)
-                |  atomic_bar_enable
-                | (pad_int_enc   << 22)
-                | (pad_amt_enc   << 25)
-                | (cluster_mask  & 0xFFFFu);
-
-    const uint32_t tdim0    = static_cast<uint32_t>(tensor_cols);
-    const uint32_t tdim1    = static_cast<uint32_t>(tensor_rows);
-    const uint32_t tiledim0 = static_cast<uint32_t>(COLS);
-    const uint32_t tiledim1 = static_cast<uint32_t>(ROWS);
-
-    // barrier_addr occupies w1[15:0]; tensor_dim0 lo16 occupies w1[31:16].
-    uint32_t w1 = (bar_lds_addr & 0xFFFFu) | (tdim0 << 16);
-    uint32_t w2 = (tdim0 >> 16) | (tdim1 << 16);
-    uint32_t w3 = (tdim1 >> 16) | (tiledim0 << 16);
-    uint32_t w4 = tiledim1;
-
-    const uint64_t stride0 = static_cast<uint64_t>(
-        static_cast<uint32_t>(row_stride * sizeof(T)));
-    uint32_t w5 = static_cast<uint32_t>(stride0);
-    uint32_t w6 = static_cast<uint32_t>(stride0 >> 32);
-    uint32_t w7 = 0;
-
-    g1[0] = w0; g1[1] = w1; g1[2] = w2; g1[3] = w3;
-    g1[4] = w4; g1[5] = w5; g1[6] = w6; g1[7] = w7;
+template<typename T, int ROWS, int COLS, typename GL, typename COORD>
+__device__ __forceinline__ const T* tdm_tile_base(const GL& src, const COORD& idx)
+{
+    const int gr_base = idx.r * ROWS;
+    const int gc_base = idx.c * COLS;
+    return src.raw_ptr
+         + (((int64_t(idx.b) * src.depth() + idx.d) * src.rows() + gr_base)
+            * src.cols() + gc_base);
 }
 
 } // namespace detail
 
+/**
+ * @brief Hardware tile DMA (TDM) global -> LDS load (udna1, derived form).
+ *
+ * Mirrors the canonical `load(tile, gl, idx)`: the source tensor extents, dense
+ * row stride, dtype, tile dims, LDS padding, LDS address and global base are ALL
+ * derived from `dst` + `src` + `idx`. The only optional behavior (auto-arrive,
+ * multicast) lives in `tdm_opts`.
+ *
+ * Issues a single `tensor_load_to_lds` for the whole wave (no VGPR operands,
+ * ignores the active-thread mask). Drain with `kittens::sync::wait_tdm()`, or,
+ * when `opts.arrive` is set, wait on the barrier's phase flip via
+ * `kittens::sync::wait_barrier(opts.arrive, phase)`.
+ *
+ * @param dst   Destination `st` tile (its shape's pad fields drive the D#).
+ * @param src   Global tile descriptor (supplies extents + dense stride).
+ * @param idx   Tile coordinate.
+ * @param opts  Optional: `.arrive` LDS barrier cell, `.cluster` multicast mask.
+ */
 template<typename T, int ROWS, int COLS, ducks::st_shape::all Shape,
          ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
+__device__ inline void load_tdm(st<T, ROWS, COLS, Shape>& dst, const GL& src,
+                                const COORD& idx, tdm_opts opts = {})
+{
+    const T* base = detail::tdm_tile_base<T, ROWS, COLS>(src, idx);
+    const uint32_t bar = opts.arrive
+        ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(opts.arrive)) : 0u;
+    detail::issue_tdm_load<Shape, ROWS, COLS, T>(
+        dst, base,
+        static_cast<int>(src.rows()), static_cast<int>(src.cols()),
+        static_cast<int>(src.template stride<2>()),
+        opts.cluster, bar);
+}
+
+/**
+ * @brief Deprecated: explicit-extent TDM load (pre-derived surface).
+ *
+ * Back-compat shim for the original 6-arg form. New code should let the extents
+ * and dense stride be derived from `src`: `load_tdm(dst, src, idx)` (optionally
+ * `{.arrive = &bar}` / `{.cluster = mask}`). Forwarding shim retained for one
+ * release.
+ */
+template<typename T, int ROWS, int COLS, ducks::st_shape::all Shape,
+         ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
+[[deprecated("extents are derived from src; use load_tdm(dst, src, idx, opts)")]]
 __device__ inline void load_tdm(st<T, ROWS, COLS, Shape>& dst, const GL& src,
                                 const COORD& idx,
                                 int tensor_rows, int tensor_cols, int row_stride,
                                 uint32_t cluster_mask = 0)
 {
-    const int gr_base = idx.r * ROWS;
-    const int gc_base = idx.c * COLS;
-    const T* base = src.raw_ptr
-                  + (((int64_t(idx.b) * src.depth() + idx.d) * src.rows() + gr_base)
-                     * src.cols() + gc_base);
-
-    detail::v4u32 g0;
-    detail::v8u32 g1;
-    detail::build_tdm_descriptor_2d<Shape, ROWS, COLS, T>(
-        g0, g1, base, dst.data, tensor_rows, tensor_cols, row_stride,
-        cluster_mask, /*bar_lds_addr=*/ 0);
-
-    detail::v4u32 g2 = {0, 0, 0, 0};
-    detail::v4u32 g3 = {0, 0, 0, 0};
-    __builtin_amdgcn_tensor_load_to_lds(g0, g1, g2, g3, 0);
+    const T* base = detail::tdm_tile_base<T, ROWS, COLS>(src, idx);
+    detail::issue_tdm_load<Shape, ROWS, COLS, T>(
+        dst, base, tensor_rows, tensor_cols, row_stride, cluster_mask, /*bar=*/0);
 }
 
 /**
- * @brief TDM load that auto-arrives at an LDS barrier on completion.
- * @experimental
+ * @brief Deprecated: TDM load that auto-arrives at an LDS barrier on completion.
  *
- * Sets `atomic_barrier_enable` in the D# so the TDM unit emits a
- * `DS_ATOMIC_ASYNC_BARRIER_ARRIVE_B64` on `bar` after the transfer retires.
- * The consumer waits on `bar`'s phase flip via
- * `kittens::sync::wait_barrier(bar, phase)` instead of draining the global
- * `tensorcnt`, leaving unrelated TDM transfers in flight.
+ * Folded into `tdm_opts.arrive`: prefer
+ * `load_tdm(dst, src, idx, {.arrive = bar})`. The barrier must be primed via
+ * `kittens::sync::init_barrier(bar, count)` before the first referencing call.
+ * Forwarding shim retained for one release.
  *
- * The barrier must be primed via `kittens::sync::init_barrier(bar, count)`
- * before the first call referencing it. `count` is the number of
- * `load_tdm_arrive` invocations that target this barrier per phase.
- *
- * @note The D# bit positions for `atomic_barrier_enable` (`w0` bit 18) and
- * `atomic_barrier_address` (`w1[15:0]`) match the field table documented
- * in the Triton AMD backend (third_party/amd/lib/TritonAMDGPUToLLVM/
- * TDMUtility.cpp lines 224-264). The Triton lowering itself does not use
- * the D# auto-arrive path -- it follows `load_tdm` with an explicit
- * `wait_tdm()` + `async_barrier_arrive()` sequence (see
- * `gemm_tdm_arrive.cpp` for that pattern). This overload is provided for
- * runtimes that model TDM auto-arrive natively; on simulators that don't,
- * use the explicit-arrive pattern instead.
- *
- * @param bar  Pointer to a 64-bit LDS barrier counter (a `sync::barrier_lds`
- *             cell). Must point at LDS storage; must be 8-byte aligned.
+ * @note See the original design note: the D# auto-arrive path
+ * (`atomic_barrier_enable` w0 bit 18, `atomic_barrier_address` w1[15:0]) is for
+ * runtimes that model it natively; simulators that don't should use the explicit
+ * `wait_tdm()` + `async_barrier_arrive()` pattern (see `gemm_tdm_arrive.cpp`).
  */
 template<typename T, int ROWS, int COLS, ducks::st_shape::all Shape,
          ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
+[[deprecated("use load_tdm(dst, src, idx, {.arrive = bar})")]]
 __device__ inline void load_tdm_arrive(
     st<T, ROWS, COLS, Shape>& dst, const GL& src, const COORD& idx,
     int tensor_rows, int tensor_cols, int row_stride,
     uint64_t* bar, uint32_t cluster_mask = 0)
 {
-    const int gr_base = idx.r * ROWS;
-    const int gc_base = idx.c * COLS;
-    const T* base = src.raw_ptr
-                  + (((int64_t(idx.b) * src.depth() + idx.d) * src.rows() + gr_base)
-                     * src.cols() + gc_base);
-
-    const uint32_t bar_lds_addr = static_cast<uint32_t>(
-        reinterpret_cast<uintptr_t>(bar));
-
-    detail::v4u32 g0;
-    detail::v8u32 g1;
-    detail::build_tdm_descriptor_2d<Shape, ROWS, COLS, T>(
-        g0, g1, base, dst.data, tensor_rows, tensor_cols, row_stride,
-        cluster_mask, bar_lds_addr);
-
-    detail::v4u32 g2 = {0, 0, 0, 0};
-    detail::v4u32 g3 = {0, 0, 0, 0};
-    __builtin_amdgcn_tensor_load_to_lds(g0, g1, g2, g3, 0);
+    const T* base = detail::tdm_tile_base<T, ROWS, COLS>(src, idx);
+    const uint32_t bar_lds_addr =
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(bar));
+    detail::issue_tdm_load<Shape, ROWS, COLS, T>(
+        dst, base, tensor_rows, tensor_cols, row_stride, cluster_mask, bar_lds_addr);
 }
 
 /**
