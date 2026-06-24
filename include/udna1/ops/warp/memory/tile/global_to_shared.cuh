@@ -327,6 +327,42 @@ __device__ __forceinline__ void issue_tdm_load(
     __builtin_amdgcn_tensor_load_to_lds(g0, g1, g2, g3, 0);
 }
 
+/**
+ * @brief Build a dense affine store descriptor and issue the TDM store builtin.
+ *
+ * The store-direction mirror of `issue_tdm_load`: the descriptor is built by the
+ * SAME `encode_tdm` lowering (groups 0/1 + dense affine groups 2/3 = 0); only
+ * `dir` and the dispatched builtin differ (`tensor_store_from_lds`). The `st`
+ * tile is the LDS SOURCE here (`d.lds_addr = src.data`); `base` is the global
+ * destination top-left.
+ *
+ * Per SP3 the `workgroup_mask` (multicast) is load-only, so stores hard-zero the
+ * cluster mask. `bar_lds_addr == 0` means ordering-only (drain via `wait_tdm`);
+ * non-zero sets the D# auto-arrive on store retirement (XACK).
+ */
+template<typename Shape, int ROWS, int COLS, typename T>
+__device__ __forceinline__ void issue_tdm_store(
+    const st<T, ROWS, COLS, Shape>& src, T* base,
+    int tensor_rows, int tensor_cols, int row_stride,
+    uint32_t bar_lds_addr)
+{
+    tdm_desc d;
+    d.base         = reinterpret_cast<uint64_t>(base);
+    d.lds_addr     = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(src.data));
+    d.tensor_rows  = static_cast<uint32_t>(tensor_rows);
+    d.tensor_cols  = static_cast<uint32_t>(tensor_cols);
+    d.row_stride_e = static_cast<uint32_t>(row_stride);
+    d.cluster_mask = 0;            // multicast is load-only (SP3); stores ignore it.
+    d.bar_lds_addr = static_cast<uint16_t>(bar_lds_addr);
+    d.mode         = tdm_mode::affine;
+    d.dir          = tdm_dir::store;
+
+    v4u32 g0, g2, g3;
+    v8u32 g1;
+    encode_tdm<Shape, ROWS, COLS, T>(d, g0, g1, g2, g3);
+    __builtin_amdgcn_tensor_store_from_lds(g0, g1, g2, g3, 0);
+}
+
 template<typename T, int ROWS, int COLS, typename GL, typename COORD>
 __device__ __forceinline__ const T* tdm_tile_base(const GL& src, const COORD& idx)
 {
@@ -370,6 +406,44 @@ __device__ inline void load_tdm(st<T, ROWS, COLS, Shape>& dst, const GL& src,
         static_cast<int>(src.rows()), static_cast<int>(src.cols()),
         static_cast<int>(src.template stride<2>()),
         opts.cluster, bar);
+}
+
+/**
+ * @brief Hardware tile DMA (TDM) LDS -> global store (udna1, derived form).
+ *
+ * The store-direction mirror of `load_tdm`: issues a single
+ * `tensor_store_from_lds` for the whole wave, writing the `src` `st` tile back
+ * to the `dst` global tile at `idx`. The destination tensor extents, dense row
+ * stride, dtype, tile dims, LDS address and global base are ALL derived from
+ * `dst` + `src` + `idx` -- nothing derivable is repeated at the call site.
+ *
+ * Drain with `kittens::sync::wait_tdm()` (loads and stores share `tensorcnt`),
+ * or, when `opts.arrive` is set, wait on the barrier's phase flip via
+ * `kittens::sync::wait_barrier(opts.arrive, phase)`.
+ *
+ * @note Per SP3 the multicast/`workgroup_mask` and LDS-pad fields are load-only;
+ *       `opts.cluster` is ignored on the store path. Use only non-padded shapes
+ *       on the store path until the LDS pad encoding is reconciled (see the
+ *       [UNVERIFIED] note in `tdm_descriptor.cuh`).
+ *
+ * @param dst   Destination global tile descriptor (supplies extents + stride).
+ * @param src   Source `st` tile (LDS source; its dims/dtype drive the D#).
+ * @param idx   Tile coordinate inside `dst`.
+ * @param opts  Optional: `.arrive` LDS barrier cell to auto-arrive on completion.
+ */
+template<typename T, int ROWS, int COLS, ducks::st_shape::all Shape,
+         ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
+__device__ inline void store_tdm(const GL& dst, const st<T, ROWS, COLS, Shape>& src,
+                                 const COORD& idx, tdm_opts opts = {})
+{
+    T* base = const_cast<T*>(detail::tdm_tile_base<T, ROWS, COLS>(dst, idx));
+    const uint32_t bar = opts.arrive
+        ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(opts.arrive)) : 0u;
+    detail::issue_tdm_store<Shape, ROWS, COLS, T>(
+        src, base,
+        static_cast<int>(dst.rows()), static_cast<int>(dst.cols()),
+        static_cast<int>(dst.template stride<2>()),
+        bar);
 }
 
 /**
