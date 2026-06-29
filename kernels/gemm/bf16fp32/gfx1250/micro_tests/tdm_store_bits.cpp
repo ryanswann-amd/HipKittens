@@ -6,6 +6,13 @@
  * stores via `store_tdm`, then compares the raw uint16 bits read back from
  * global. Immune to bf16 rounding: any permutation/granularity bug shows up
  * as a bit mismatch.
+ *
+ *   LDS (raw bits = linear index)        dst (top-left 32x64 window)
+ *   [0x0000][0x0001][0x0002]...   store  [0x0000][0x0001][0x0002]...
+ *   [0x0040][0x0041]...          ======> [0x0040][0x0041]...
+ *        ... element i = (u16)i ...           ... must equal i ...
+ *   Compared AS BITS, not as bf16 numbers: a reorder or wrong transfer
+ *   granularity surfaces as an exact 0xXXXX vs 0xYYYY mismatch.
  */
 
 #include "kittens.cuh"
@@ -30,9 +37,13 @@ void tdm_store_bits_kernel(gl<bf16, -1, -1, -1, -1> dst)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
+    // Flat LDS buffer viewed as a non-padded `st`; the store source.
     bf16(&buf)[TILE_ELEMS] = al.allocate_in<segment<0>, bf16, TILE_ELEMS>();
     auto& tile = *reinterpret_cast<st<bf16, ROWS, COLS, NoPad>*>(&buf[0]);
 
+    // Write the linear index as the raw 16-bit value of each element. Treating it
+    // as bits (not a bf16 number) makes the later compare immune to bf16 rounding:
+    // any reorder/granularity bug shows up as a distinct, exact bit mismatch.
     for (int i = threadIdx.x; i < TILE_ELEMS; i += NUM_THREADS) {
         using lds_u16 = uint16_t __attribute__((address_space(3)));
         auto* lds_p = (lds_u16*)(reinterpret_cast<uintptr_t>(&buf[0]));
@@ -40,6 +51,7 @@ void tdm_store_bits_kernel(gl<bf16, -1, -1, -1, -1> dst)
     }
     sync::sync();
 
+    // One warp stores the tile to the top-left of `dst`; drain before host readback.
     if (warpid() == 0) {
         store_tdm(dst, tile, {0, 0, 0, 0});
         tdm::store_async_wait();
@@ -69,6 +81,8 @@ int main()
 
     hipMemcpy(h_dst.data(), d_dst, dst_total * sizeof(uint16_t), hipMemcpyDeviceToHost);
 
+    // Exact-bit check inside the tile, plus a zero check outside it (the store
+    // must leave the surrounding destination untouched).
     int errors = 0;
     for (int r = 0; r < ROWS; ++r)
         for (int c = 0; c < COLS; ++c) {

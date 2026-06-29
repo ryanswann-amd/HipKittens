@@ -5,6 +5,15 @@
  * Fills LDS with a float pattern, stores a ROWSxCOLS tile into the top-left
  * of a larger destination matrix with `kittens::store_tdm(gl, st, coord)`,
  * and checks the destination region (bf16-rounded reference).
+ *
+ *   LDS tile: 32 x 32              dst: 64 x 64 (rest must stay 0)
+ *   +-------------+                +--------------------------------+
+ *   |   32 x 32   |    store       | 32x32 |                        |
+ *   |  (pattern)  | =========>     | tile  |        0 ...           |
+ *   +-------------+                |-------+                        |
+ *                                  |              0 ...             |
+ *                                  +--------------------------------+
+ *   coord {0,0,0,0} -> only the top-left 32x32 window is written.
  */
 
 #include "kittens.cuh"
@@ -29,9 +38,11 @@ void tdm_store_kernel(gl<bf16, -1, -1, -1, -1> dst)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
+    // Flat LDS buffer viewed as a non-padded `st`; this is the store *source*.
     bf16(&buf)[TILE_ELEMS] = al.allocate_in<segment<0>, bf16, TILE_ELEMS>();
     auto& tile = *reinterpret_cast<st<bf16, ROWS, COLS, NoPad>*>(&buf[0]);
 
+    // All threads seed LDS with a per-element pattern (r*100+c+1) before the store.
     for (int i = threadIdx.x; i < TILE_ELEMS; i += NUM_THREADS) {
         int r = i / COLS, c = i % COLS;
         using lds_u16 = uint16_t __attribute__((address_space(3)));
@@ -39,8 +50,10 @@ void tdm_store_kernel(gl<bf16, -1, -1, -1, -1> dst)
         __hip_bfloat16 v(float(r * 100 + c + 1));
         lds_p[i] = *reinterpret_cast<const uint16_t*>(&v);
     }
-    sync::sync();
+    sync::sync();   // all rows written before the engine reads LDS
 
+    // One warp stores the tile to the top-left of `dst` (coord {b,d,row,col}=0).
+    // store_tdm mirrors load_tdm with the gl/st argument order flipped.
     if (warpid() == 0) {
         store_tdm(dst, tile, {0, 0, 0, 0});
         tdm::store_async_wait();
@@ -69,6 +82,8 @@ int main()
 
     hipMemcpy(h_dst.data(), d_dst, dst_total * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost);
 
+    // Inside the tile region expect the seeded pattern; outside it expect zero
+    // (the store must not touch the rest of the destination matrix).
     int errors = 0;
     for (int r = 0; r < DST_ROWS; ++r)
         for (int c = 0; c < DST_COLS; ++c) {

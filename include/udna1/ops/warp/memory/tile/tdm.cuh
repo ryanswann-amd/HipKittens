@@ -22,11 +22,11 @@
  *     `tdm::detail::tdm_desc`, through one `encode(...)` point.
  *
  * The descriptor bit layout reproduced in `encode` is the one validated
- * bit-exact against the software functional model (the project's
- * correctness oracle). Strides and tensor extents are in **element**
- * units; padding interval/amount are in element units and encoded per SP3.
- * The completion model is a single per-descriptor `TENSORcnt` tick, drained
- * via `tdm::load_async_wait<N>()` (lowers to `s_wait_tensorcnt N`).
+ * bit-exact against the project's correctness oracle. Strides and tensor
+ * extents are in **element** units; padding interval/amount are in element
+ * units and encoded per SP3. Completion is a single per-descriptor
+ * `TENSORcnt` tick, drained via `tdm::load_async_wait<N>()` (lowers to
+ * `s_wait_tensorcnt N`).
  */
 
 #pragma once
@@ -111,7 +111,7 @@ struct affine {
  *
  * Constructible so call sites compile, but passing it to a verb is a
  * compile-time hard-stop: the iterate sub-field offsets are unverified and
- * the functional model tags iterate as untested. See the design doc.
+ * its behavior is untested by the correctness oracle. See the design doc.
  */
 struct iterate {
     uint32_t lds_inc = 0, gbl_inc = 0, count = 0;
@@ -179,7 +179,7 @@ struct tdm_desc {
 /**
  * @brief The single lowering point: pack a `tdm_desc` into the four operands.
  *
- * Bit positions reproduce the model-validated layout (see file header). The
+ * Bit positions reproduce the oracle-validated layout (see file header). The
  * descriptor is a 640-bit value spread across four SGPR operands -- group 0
  * (4 DWords), group 1 (8 DWords), group 2 (4 DWords), group 3 (4 DWords) --
  * consumed by `tensor_load_to_lds` / `tensor_store_from_lds`. Multi-byte
@@ -418,7 +418,7 @@ __device__ __forceinline__ void pack_rows(
 } // namespace detail
 
 /* ============================================================ *
- *  Completion helpers (D-completion model)
+ *  Completion helpers (per-descriptor TENSORcnt)
  * ============================================================ */
 
 /// @brief Drain pending TDM transfers, leaving at most N in flight.
@@ -629,8 +629,8 @@ __device__ inline void load_tdm(
 {
     static_assert(tdm::detail::iterate_hardstop<T>::value,
         "tdm::iterate is hard-stopped: the iterate "
-        "sub-field offsets are unverified and the functional model tags "
-        "iterate as untested. Issue separate descriptors per tile instead.");
+        "sub-field offsets are unverified and its behavior is untested by "
+        "the correctness oracle. Issue separate descriptors per tile instead.");
 }
 
 } // namespace kittens

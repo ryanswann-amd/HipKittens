@@ -6,6 +6,16 @@
  * `kittens::load_tdm(st, gl, coord)` -- extents/stride/dtype/tile dims/LDS
  * address are all derived from the `st` and `gl`. Reads LDS back flat and
  * compares against the source tile.
+ *
+ *   src: 64 x 64 (row-major, bf16)            LDS tile: 16 x 32
+ *   +--------------------------------+
+ *   | 16x32 |                        |          +-------------+
+ *   | tile  |                        |  load    |   16 x 32   |
+ *   |-------+      (rest unused)     | =======> | (contiguous)|
+ *   |                                |          +-------------+
+ *   |              ...               |
+ *   +--------------------------------+
+ *   coord {b,d,row,col} = {0,0,0,0}  -> window anchored at the top-left.
  */
 
 #include "kittens.cuh"

@@ -4,6 +4,20 @@
  *
  * Innermost plane (D1 x D0) derived from the `st`; the three outer axes ride
  * in a `tdm::affine` value. Exercises all 20 descriptor DWords.
+ *
+ *   tensor  T4 x T3 x T2 x T1 x T0 = 4 x 4 x 4 x 32 x 32
+ *   window  D4 x D3 x D2 x D1 x D0 = 2 x 2 x 2 x 16 x 16
+ *
+ *   axis0/1 (inner 16x16 plane)  <- derived from `st` + `gl`
+ *   axis2/3/4 (outer nesting)    <- ride in tdm::affine as (extent,stride,tile)
+ *
+ *   The window is D4*D3*D2 = 8 inner 16x16 planes; the engine writes them
+ *   contiguously into LDS in row-major (axis4 outer ... axis2 inner) order:
+ *
+ *     LDS: [plane 0][plane 1][plane 2] ... [plane 7]   (each 16x16)
+ *
+ *   Strides are cumulative products of the tensor's inner extents:
+ *     stride2 = T1*T0,  stride3 = T2*T1*T0,  stride4 = T3*T2*T1*T0.
  */
 
 #include "kittens.cuh"

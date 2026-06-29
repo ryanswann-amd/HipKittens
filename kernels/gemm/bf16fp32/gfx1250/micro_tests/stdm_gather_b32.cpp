@@ -1,19 +1,18 @@
 /**
- * @file stdm_gather.cpp
- * @brief Micro-test: row-indexed gather via load_tdm(st, gl, rows, n).
+ * @file stdm_gather_b32.cpp
+ * @brief Micro-test: row-indexed gather with 32-bit indices (idx_width::b32).
  *
- * Gathers 16 non-contiguous rows (uint16 index mode) of a 2D matrix into a
+ * Same as stdm_gather but exercises the wide-index packing: b32 fits 8 indices
+ * per descriptor (vs 16 for b16). Gathers 8 non-contiguous rows into a
  * contiguous LDS tile and verifies each gathered row matches the source.
  *
- *   src: 256 x 64                       LDS tile: 16 x 32 (dense)
- *   row 0   ----------\                 +-------------+
- *   row 15  -----------\     gather     | row 0  <- src row 0   |
- *   row 30  ------------>  pack contig. | row 1  <- src row 15  |
- *    ...                                | row 2  <- src row 30  |
- *   row 225 -----------/                |      ...              |
- *                                       +-------------+
- *   rows[] = {0,15,30,...,225}  -> gathered row i = src row rows[i].
- *   (An index >= src rows would zero-fill that LDS row.)
+ *   src: 256 x 64                       LDS tile: 8 x 32 (dense)
+ *   row 3   ----------\                 +-------------+
+ *   row 33  -----------\     gather     | row 0  <- src row 3   |
+ *   row 70  ------------>  pack contig. | row 1  <- src row 33  |
+ *    ...                                |      ...              |
+ *   row 240 -----------/                +-------------+
+ *   rows[] (8 entries, b32) -> gathered row i = src row rows[i].
  */
 
 #include "kittens.cuh"
@@ -25,7 +24,7 @@
 
 using namespace kittens;
 
-constexpr int GATHER_ROWS = 16;
+constexpr int GATHER_ROWS = 8;          // b32 cap is 8 indices per descriptor
 constexpr int GATHER_COLS = 32;
 constexpr int TILE_ELEMS  = GATHER_ROWS * GATHER_COLS;
 constexpr int NUM_THREADS = 128;
@@ -34,33 +33,25 @@ constexpr int SRC_COLS = 64;
 using NoPad = ducks::st_shape::st_8x32;
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
-void stdm_gather_kernel(const gl<bf16, -1, -1, -1, -1> src,
-                        gl<bf16, -1, -1, -1, -1> dst)
+void stdm_gather_b32_kernel(const gl<bf16, -1, -1, -1, -1> src,
+                            gl<bf16, -1, -1, -1, -1> dst)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
-    // Flat LDS buffer viewed as a non-padded `st`: the gather packs the selected
-    // rows contiguously, so the tile's storage is plain row-major and can be read
-    // back as a flat array. `tile` is what we hand to the verb.
     bf16(&buf)[TILE_ELEMS] = al.allocate_in<segment<0>, bf16, TILE_ELEMS>();
     auto& tile = *reinterpret_cast<st<bf16, GATHER_ROWS, GATHER_COLS, NoPad>*>(&buf[0]);
 
-    // The row indices select gather mode (passing a (rows, n) pair instead of a
-    // coord). They must be sorted, unique, and wave-uniform; here they pick every
-    // 15th source row. gather_row i lands in LDS row i, regardless of src_row[i].
-    uint32_t rows[16] = {0, 15, 30, 45, 60, 75, 90, 105,
-                         120, 135, 150, 165, 180, 195, 210, 225};
+    // Sorted, unique, wave-uniform indices; 8 of them so they fit one b32 op.
+    uint32_t rows[8] = {3, 33, 70, 101, 150, 188, 220, 240};
 
-    // One warp issues the gather descriptor; idx_w=b16 packs up to 16 indices into
-    // one descriptor. The wait drains TENSORcnt to 0 so the tile is populated.
+    // idx_w=b32 -> indices are packed one per DWord (8 max). The wait drains
+    // TENSORcnt so the gathered tile is populated before readback.
     if (warpid() == 0) {
-        load_tdm(tile, src, rows, 16, {.idx_w = tdm::idx_width::b16});
+        load_tdm(tile, src, rows, 8, {.idx_w = tdm::idx_width::b32});
         tdm::load_async_wait();
     }
     sync::sync();
 
-    // Stream the gathered tile out to `dst` as raw 16-bit values. The LDS pointer
-    // needs address_space(3) so the compiler emits ds_* reads of shared memory.
     for (int i = threadIdx.x; i < TILE_ELEMS; i += NUM_THREADS) {
         using lds_u16 = const uint16_t __attribute__((address_space(3)));
         auto* lds_p = (lds_u16*)(reinterpret_cast<uintptr_t>(&buf[0]));
@@ -70,11 +61,9 @@ void stdm_gather_kernel(const gl<bf16, -1, -1, -1, -1> src,
 
 int main()
 {
-    std::printf("stdm_gather: %d rows x %d cols from [%d x %d]\n",
+    std::printf("stdm_gather_b32: %d rows x %d cols (b32) from [%d x %d]\n",
                 GATHER_ROWS, GATHER_COLS, SRC_ROWS, SRC_COLS);
 
-    // Source: each element encodes its own (row, col) as row*100+c so a mismatch
-    // immediately reveals which source row was actually fetched.
     constexpr int src_total = SRC_ROWS * SRC_COLS;
     std::vector<__hip_bfloat16> h_src(src_total), h_dst(TILE_ELEMS, __hip_bfloat16(0.f));
     for (int r = 0; r < SRC_ROWS; ++r)
@@ -87,22 +76,18 @@ int main()
     hipMemcpy(d_src, h_src.data(), src_total * sizeof(__hip_bfloat16), hipMemcpyHostToDevice);
     hipMemset(d_dst, 0, TILE_ELEMS * sizeof(__hip_bfloat16));
 
-    // src_gl is the full 2D matrix the engine indexes into; dst_gl is a flat
-    // landing buffer for the gathered tile that we copy back to the host.
     gl<bf16, -1, -1, -1, -1> src_gl(d_src, 1, 1, size_t(SRC_ROWS), size_t(SRC_COLS));
     gl<bf16, -1, -1, -1, -1> dst_gl(d_dst, 1, 1, 1, size_t(TILE_ELEMS));
 
-    // TDM needs the whole tile in dynamic shared memory; opt in past the static cap.
     size_t shm = TILE_ELEMS * sizeof(__hip_bfloat16) + 256;
-    hipFuncSetAttribute(reinterpret_cast<const void*>(stdm_gather_kernel),
+    hipFuncSetAttribute(reinterpret_cast<const void*>(stdm_gather_b32_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, shm);
-    stdm_gather_kernel<<<1, NUM_THREADS, shm, 0>>>(src_gl, dst_gl);
+    stdm_gather_b32_kernel<<<1, NUM_THREADS, shm, 0>>>(src_gl, dst_gl);
     hipDeviceSynchronize();
 
     hipMemcpy(h_dst.data(), d_dst, TILE_ELEMS * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost);
 
-    // Verify gathered row gi holds source row rows_ref[gi], element for element.
-    int rows_ref[16] = {0,15,30,45,60,75,90,105,120,135,150,165,180,195,210,225};
+    int rows_ref[8] = {3, 33, 70, 101, 150, 188, 220, 240};
     int errors = 0;
     for (int gi = 0; gi < GATHER_ROWS; ++gi) {
         int src_row = rows_ref[gi];

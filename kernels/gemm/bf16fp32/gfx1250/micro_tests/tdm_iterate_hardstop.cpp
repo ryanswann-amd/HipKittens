@@ -3,10 +3,19 @@
  * @brief Negative compile-test: iterate mode is hard-stopped.
  *
  * Passing a `tdm::iterate` value to `load_tdm` MUST fail to compile (the
- * iterate sub-field offsets are unverified; the functional model tags
- * iterate as untested). This file is expected to NOT compile -- the test
+ * iterate sub-field offsets are unverified and its behavior is untested by
+ * the correctness oracle). This file is expected to NOT compile -- the test
  * runner asserts a compile *failure* and treats a successful build as a
  * regression. See `run_tdm_tests.sh`.
+ *
+ *   What iterate WOULD do (one descriptor stepped `count` times):
+ *     global G:  [tile k=0][tile k=1][tile k=2]   (advance by gbl_inc/step)
+ *                     |         |         |
+ *                     v         v         v
+ *     LDS ring:  [ slab 0 ][ slab 1 ][ slab 2 ]   (advance by lds_inc/step)
+ *
+ *   ...but the sub-field offsets are unverified, so the builder is a hard
+ *   stop: this call must trip a static_assert rather than emit guessed bits.
  */
 
 #include "kittens.cuh"

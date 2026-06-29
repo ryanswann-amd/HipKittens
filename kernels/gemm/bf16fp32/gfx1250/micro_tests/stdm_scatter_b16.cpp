@@ -1,20 +1,19 @@
 /**
- * @file stdm_scatter.cpp
- * @brief Micro-test: row-indexed scatter via store_tdm(gl, st, rows, n).
+ * @file stdm_scatter_b16.cpp
+ * @brief Micro-test: row-indexed scatter with 16-bit indices (idx_width::b16).
  *
- * Fills LDS with a known pattern and scatters 8 rows (uint32 index mode) to
- * non-contiguous rows of a 2D matrix; verifies the target rows and that the
- * rest stays zero.
+ * Same as stdm_scatter but exercises the narrow-index packing: b16 fits 16
+ * indices per descriptor (vs 8 for b32). Fills LDS with a known pattern and
+ * scatters 16 rows to non-contiguous rows of a 2D matrix; verifies the target
+ * rows and that the rest stays zero.
  *
- *   LDS tile: 8 x 32 (pattern)          dst: 128 x 64 (rest stays 0)
- *   +-------------+                      dst row 10  <- LDS row 0
+ *   LDS tile: 16 x 32 (pattern)         dst: 256 x 64 (rest stays 0)
+ *   +-------------+                      dst row 5   <- LDS row 0
  *   | row 0 ------\------- scatter ----> dst row 20  <- LDS row 1
- *   | row 1 -------\-----------------\-> dst row 30  <- LDS row 2
- *   | row 2 ...     \                 \      ...
- *   +-------------+                      dst row 80  <- LDS row 7
- *   rows[] = {10,20,30,...,80}  -> LDS row i written to dst row rows[i].
- *   (Same descriptor as gather; an OOB destination index is skipped,
- *    not zero-filled.)
+ *   | row 1 -------\----------------\--> dst row 35  <- LDS row 2
+ *   |  ...                           \       ...
+ *   +-------------+                      dst row 230 <- LDS row 15
+ *   rows[] (16 entries, b16) -> LDS row i written to dst row rows[i].
  */
 
 #include "kittens.cuh"
@@ -26,25 +25,22 @@
 
 using namespace kittens;
 
-constexpr int SCATTER_ROWS = 8;
+constexpr int SCATTER_ROWS = 16;        // b16 cap is 16 indices per descriptor
 constexpr int SCATTER_COLS = 32;
 constexpr int TILE_ELEMS   = SCATTER_ROWS * SCATTER_COLS;
 constexpr int NUM_THREADS  = 128;
-constexpr int DST_ROWS = 128;
+constexpr int DST_ROWS = 256;
 constexpr int DST_COLS = 64;
-using NoPad = ducks::st_shape::st_8x32;
+using NoPad = ducks::st_shape::st_16x16;
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
-void stdm_scatter_kernel(gl<bf16, -1, -1, -1, -1> dst)
+void stdm_scatter_b16_kernel(gl<bf16, -1, -1, -1, -1> dst)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
-    // Flat LDS buffer viewed as a non-padded `st`; this is the scatter *source*.
     bf16(&buf)[TILE_ELEMS] = al.allocate_in<segment<0>, bf16, TILE_ELEMS>();
     auto& tile = *reinterpret_cast<st<bf16, SCATTER_ROWS, SCATTER_COLS, NoPad>*>(&buf[0]);
 
-    // Seed LDS with a known per-element pattern (r*100+c+1). All 128 threads fill
-    // it cooperatively, writing raw bf16 bits via an address_space(3) pointer.
     for (int i = threadIdx.x; i < TILE_ELEMS; i += NUM_THREADS) {
         int r = i / SCATTER_COLS, c = i % SCATTER_COLS;
         using lds_u16 = uint16_t __attribute__((address_space(3)));
@@ -52,15 +48,14 @@ void stdm_scatter_kernel(gl<bf16, -1, -1, -1, -1> dst)
         __hip_bfloat16 v(float(r * 100 + c + 1));
         lds_p[i] = *reinterpret_cast<const uint16_t*>(&v);
     }
-    sync::sync();   // ensure all rows are written before the engine reads LDS
+    sync::sync();
 
-    // Destination rows for the scatter: LDS row i is written to dst row rows[i].
-    uint32_t rows[8] = {10, 20, 30, 40, 50, 60, 70, 80};
+    // 16 sorted, unique destination rows -> one b16 descriptor.
+    uint32_t rows[16] = {5, 20, 35, 50, 65, 80, 95, 110,
+                         125, 140, 155, 170, 185, 200, 215, 230};
 
-    // One warp issues the scatter (same descriptor as gather, store verb). idx_w
-    // =b32 packs up to 8 indices. Drain TENSORcnt before the LDS source is reused.
     if (warpid() == 0) {
-        store_tdm(dst, tile, rows, 8, {.idx_w = tdm::idx_width::b32});
+        store_tdm(dst, tile, rows, 16, {.idx_w = tdm::idx_width::b16});
         tdm::store_async_wait();
     }
     sync::sync();
@@ -68,7 +63,7 @@ void stdm_scatter_kernel(gl<bf16, -1, -1, -1, -1> dst)
 
 int main()
 {
-    std::printf("stdm_scatter: %d rows x %d cols into [%d x %d]\n",
+    std::printf("stdm_scatter_b16: %d rows x %d cols (b16) into [%d x %d]\n",
                 SCATTER_ROWS, SCATTER_COLS, DST_ROWS, DST_COLS);
 
     constexpr int dst_total = DST_ROWS * DST_COLS;
@@ -78,20 +73,18 @@ int main()
     hipMalloc(&d_dst, dst_total * sizeof(__hip_bfloat16));
     hipMemset(d_dst, 0, dst_total * sizeof(__hip_bfloat16));
 
-    // 2D destination matrix, zero-initialized so we can also detect stray writes.
     gl<bf16, -1, -1, -1, -1> dst_gl(d_dst, 1, 1, size_t(DST_ROWS), size_t(DST_COLS));
 
     size_t shm = TILE_ELEMS * sizeof(__hip_bfloat16) + 256;
-    hipFuncSetAttribute(reinterpret_cast<const void*>(stdm_scatter_kernel),
+    hipFuncSetAttribute(reinterpret_cast<const void*>(stdm_scatter_b16_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, shm);
-    stdm_scatter_kernel<<<1, NUM_THREADS, shm, 0>>>(dst_gl);
+    stdm_scatter_b16_kernel<<<1, NUM_THREADS, shm, 0>>>(dst_gl);
     hipDeviceSynchronize();
 
     hipMemcpy(h_dst.data(), d_dst, dst_total * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost);
 
-    // Two-part check: (1) each target row got its LDS row's pattern, and
-    // (2) every non-target row stayed zero (no out-of-bounds scatter writes).
-    int target_rows[8] = {10, 20, 30, 40, 50, 60, 70, 80};
+    int target_rows[16] = {5, 20, 35, 50, 65, 80, 95, 110,
+                           125, 140, 155, 170, 185, 200, 215, 230};
     int errors = 0;
     for (int gi = 0; gi < SCATTER_ROWS; ++gi) {
         int dst_row = target_rows[gi];

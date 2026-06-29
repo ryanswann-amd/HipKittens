@@ -5,6 +5,16 @@
  * Uses a padded shared-tile shape (`st_16x32_padded<>`), so the verb derives
  * pad_enable/pad_interval/pad_amount from the `st` and the TDM unit inserts
  * padding in LDS. Reads back through the same padding map and compares.
+ *
+ *   global (contiguous, row-major)
+ *   |<--- 128 elems --->|<--- 128 elems --->|...
+ *   [ d d d ... d d d   ][ d d d ... d d d   ]
+ *            |  load (engine inserts a pad gap every 128 elems)
+ *            v
+ *   LDS:
+ *   [ ...128 data... ][ 8 pad ][ ...128 data... ][ 8 pad ]...
+ *   readback maps logical index i -> physical i + (i/128)*8, skipping pads.
+ *   (Padding spreads rows across LDS banks to avoid bank conflicts.)
  */
 
 #include "kittens.cuh"
@@ -23,8 +33,12 @@ constexpr int NUM_THREADS = 128;
 constexpr int SRC_ROWS = 64;
 constexpr int SRC_COLS = 64;
 
+// Padded shape: every PAD_INTERVAL elements, PAD_AMOUNT padding elements are
+// inserted in LDS (a bank-conflict-avoidance layout). The verb reads these from
+// the `st` shape, so the call site stays identical to the dense case.
 using PadShape = ducks::st_shape::st_16x32_padded<>;  // <128, 8>
 constexpr int PAD_INTERVAL = 128, PAD_AMOUNT = 8;
+// Physical LDS footprint = logical elements + one pad gap per full interval.
 constexpr int PAD_ELEMS = TILE_ELEMS + (TILE_ELEMS / PAD_INTERVAL) * PAD_AMOUNT;
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
@@ -33,15 +47,20 @@ void tdm_padded_kernel(const gl<bf16, -1, -1, -1, -1> src,
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
+    // Allocate the padded footprint and view it through the padded `st` shape, so
+    // pad_enable/interval/amount are all derived from the tile type.
     bf16(&buf)[PAD_ELEMS] = al.allocate_in<segment<0>, bf16, PAD_ELEMS>();
     auto& tile = *reinterpret_cast<st<bf16, ROWS, COLS, PadShape>*>(&buf[0]);
 
+    // Identical to a dense load -- the only difference is the padded `st` type.
     if (warpid() == 0) {
         load_tdm(tile, src, {0, 0, 0, 0});
         tdm::load_async_wait();
     }
     sync::sync();
 
+    // Read back through the same padding map the engine used: logical index i maps
+    // to physical slot i + (i/interval)*amount, skipping the inserted pad gaps.
     for (int i = threadIdx.x; i < TILE_ELEMS; i += NUM_THREADS) {
         int padded_idx = i + (i / PAD_INTERVAL) * PAD_AMOUNT;
         using lds_u16 = const uint16_t __attribute__((address_space(3)));
@@ -68,6 +87,7 @@ int main()
     gl<bf16, -1, -1, -1, -1> src_gl(d_src, 1, 1, size_t(SRC_ROWS), size_t(SRC_COLS));
     gl<bf16, -1, -1, -1, -1> dst_gl(d_dst, 1, 1, 1, size_t(TILE_ELEMS));
 
+    // Note: reserve the padded footprint (PAD_ELEMS), not just the logical tile.
     size_t shm = PAD_ELEMS * sizeof(__hip_bfloat16) + 256;
     hipFuncSetAttribute(reinterpret_cast<const void*>(tdm_padded_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, shm);

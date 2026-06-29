@@ -6,6 +6,16 @@
  * axis rides in a `tdm::affine` value (extent, element-stride, tile count).
  * The engine writes BATCH planes contiguously into LDS; we back the `st` with
  * an oversized flat buffer and read it back flat.
+ *
+ *   src tensor [TB=4][TR=32][TC=64]            LDS: BATCH=2 planes stacked
+ *    plane0   plane1   plane2   plane3
+ *   +------+ +------+ +------+ +------+         +-----------+
+ *   |16x32 | |16x32 | | .... | | .... |  load  | plane 0   | (16x32)
+ *   | take | | take | |unused| |unused| =====> +-----------+
+ *   +------+ +------+ +------+ +------+         | plane 1   | (16x32)
+ *      \________/  (take first BATCH planes)    +-----------+
+ *   affine axis2 = (extent=TB, stride2=TR*TC elems, tile2=BATCH).
+ *   The inner 16x32 + row stride are derived from `st`/`gl`.
  */
 
 #include "kittens.cuh"

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Compile + run the TDM/sTDM micro-tests for the derive-by-default tdm:: API.
-# Compile in the cached ROCm Docker image; run against a software functional
-# model (no real GPU). All paths are env-overridable so no site-specific
-# install path is baked into the repo.
+# Compile in the cached ROCm Docker image; run in the reference environment
+# (no real GPU). All paths are env-overridable so no site-specific install
+# path is baked into the repo.
 #
 # Env overrides:
 #   REPO       repo root (default: current git toplevel)
 #   OUT        output dir for binaries (default: /tmp/tdm-out)
 #   IMG        compile image (required: a ROCm image with hipcc for the target)
-#   MODEL_ENV  path to the functional-model env script to `source` before running
+#   RUN_ENV    path to the run-environment env script to `source` before running
 #   MOUNT      host path to bind into Docker (default: REPO)
 set -uo pipefail
 REPO=${REPO:-$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null || echo .)}
@@ -16,7 +16,13 @@ OUT=${OUT:-/tmp/tdm-out}
 IMG=${IMG:?set IMG to a ROCm compile image with hipcc}
 MOUNT=${MOUNT:-$REPO}
 ARCH=${ARCH:?set ARCH to the target offload arch (e.g. the udna1 target)}
-TESTS="tdm_dense tdm_store tdm_store_bits tdm_3d tdm_5d tdm_padded stdm_gather stdm_scatter"
+# Dense 2D (load/store/bitwise), affine load 3D/4D/5D, affine store 3D/4D/5D,
+# padded load, and gather/scatter at both index widths (b16 + b32).
+TESTS="tdm_dense tdm_store tdm_store_bits \
+tdm_3d tdm_4d tdm_5d \
+tdm_3d_store tdm_4d_store tdm_5d_store \
+tdm_padded \
+stdm_gather stdm_gather_b32 stdm_scatter stdm_scatter_b16"
 MT="$REPO/kernels/gemm/bf16fp32/$ARCH/micro_tests"
 
 echo "=== node: $(hostname)  repo: $REPO ==="
@@ -43,8 +49,8 @@ else
   echo "  PASS  iterate_hardstop rejected at compile time"; hs_fail=0
 fi
 
-echo "=== [3/3] run on the functional model ==="
-[ -n "${MODEL_ENV:-}" ] && source "$MODEL_ENV"
+echo "=== [3/3] run in the reference environment ==="
+[ -n "${RUN_ENV:-}" ] && source "$RUN_ENV"
 pass=0; fail=0
 for t in $TESTS; do
   b="$OUT/$t.out"
