@@ -5,7 +5,7 @@
  * Fills LDS with a distinct 16-bit pattern per element (the linear index),
  * stores via `store_tdm`, then compares the raw uint16 bits read back from
  * global. Immune to bf16 rounding: any permutation/granularity bug shows up
- * as a bit mismatch (D8).
+ * as a bit mismatch.
  */
 
 #include "kittens.cuh"

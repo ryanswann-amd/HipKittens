@@ -33,7 +33,7 @@ docker run --rm -v "$MOUNT":"$MOUNT" -w "$MT" "$IMG" bash -c '
     fi
   done'
 
-echo "=== [2/3] iterate hard-stop must NOT compile (D9) ==="
+echo "=== [2/3] iterate hard-stop must NOT compile ==="
 if docker run --rm -v "$MOUNT":"$MOUNT" -w "$MT" "$IMG" bash -c \
      'hipcc -DKITTENS_UDNA1 --offload-arch='"$ARCH"' -std=c++20 -O3 -w \
         -I'"$REPO"'/include tdm_iterate_hardstop.cpp -o '"$OUT"'/iterate.out' \

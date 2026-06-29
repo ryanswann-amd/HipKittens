@@ -1,6 +1,6 @@
 /**
  * @file tdm_iterate_hardstop.cpp
- * @brief Negative compile-test: iterate mode is hard-stopped (D9).
+ * @brief Negative compile-test: iterate mode is hard-stopped.
  *
  * Passing a `tdm::iterate` value to `load_tdm` MUST fail to compile (the
  * iterate sub-field offsets are unverified; the functional model tags
@@ -23,7 +23,7 @@ __global__ void iterate_should_not_compile(const gl<bf16, -1, -1, -1, -1> src,
     auto& tile = *reinterpret_cast<st<bf16, 16, 32, ducks::st_shape::st_16x16>*>(&buf[0]);
 
     auto it = tdm::iterate::make(/*lds_inc=*/16, /*gbl_inc=*/4, /*count=*/3);
-    // EXPECTED: static_assert failure -- iterate is hard-stopped (D9).
+    // EXPECTED: static_assert failure -- iterate is hard-stopped.
     load_tdm(tile, src, {0, 0, 0, 0}, it);
 }
 

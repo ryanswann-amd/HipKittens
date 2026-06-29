@@ -2,28 +2,28 @@
  * @file
  * @brief Tensor Data Mover (TDM) -- derive-by-default tile transfers.
  *
- * This header implements the API described in the TDM design doc (decisions
- * D1-D10). The shape of the surface:
+ * This header implements the API described in the TDM design doc. The shape
+ * of the surface:
  *
  *   - Two verbs, one per direction: `kittens::load_tdm` / `kittens::store_tdm`.
  *   - The addressing mode is selected by the *type* of the third/fourth
- *     argument (D2):
+ *     argument:
  *       coord                       => dense N-D
  *       coord + tdm::affine         => 5D affine (extra axes 2-4)
  *       (const uint32_t* rows, n)   => gather (load) / scatter (store)
- *       coord + tdm::iterate        => hard-stopped (D9; does not emit)
+ *       coord + tdm::iterate        => hard-stopped (does not emit)
  *   - Extents, strides, dtype, tile dims, LDS address, and global base are
- *     all *derived* from `dst`, `src`, and `idx` (D1/D4). The only
- *     non-derivable higher-dimensional data rides in the `tdm::affine` value.
- *   - One options struct, `tdm::tdm_opts`, carries the optional knobs (D5):
+ *     all *derived* from `dst`, `src`, and `idx`. The only non-derivable
+ *     higher-dimensional data rides in the `tdm::affine` value.
+ *   - One options struct, `tdm::tdm_opts`, carries the optional knobs:
  *     `.arrive` (auto-arrive at an LDS barrier cell), `.cluster` (multicast
  *     mask, load only), `.idx_w` (gather index width).
  *   - All verbs lower into a single device-constructible POD,
- *     `tdm::detail::tdm_desc`, through one `encode(...)` point (D3/D10).
+ *     `tdm::detail::tdm_desc`, through one `encode(...)` point.
  *
  * The descriptor bit layout reproduced in `encode` is the one validated
  * bit-exact against the software functional model (the project's
- * correctness oracle, D7). Strides and tensor extents are in **element**
+ * correctness oracle). Strides and tensor extents are in **element**
  * units; padding interval/amount are in element units and encoded per SP3.
  * The completion model is a single per-descriptor `TENSORcnt` tick, drained
  * via `tdm::load_async_wait<N>()` (lowers to `s_wait_tensorcnt N`).
@@ -45,14 +45,14 @@ namespace kittens {
 namespace tdm {
 
 /* ============================================================ *
- *  Public addressing types and options (D2, D5)
+ *  Public addressing types and options
  * ============================================================ */
 
 /// @brief Gather/scatter row-index width. b16 => 16 rows/op, b32 => 8 rows/op.
 enum class idx_width : uint8_t { b16, b32 };
 
 /**
- * @brief Optional knobs for a TDM transfer (D5).
+ * @brief Optional knobs for a TDM transfer.
  *
  * @var arrive   When non-null, the LDS byte address of a `sync::barrier_lds`
  *               cell (`&bar.state`); sets `atomic_barrier_enable` so the TDM
@@ -68,7 +68,7 @@ struct tdm_opts {
 };
 
 /**
- * @brief Outer addressing axes (dims 2-4) for an N-D affine transfer (D4).
+ * @brief Outer addressing axes (dims 2-4) for an N-D affine transfer.
  *
  * The innermost two dims (the tile's rows/cols and the tensor's row stride)
  * are always derived from `dst`/`src`. Anything beyond that -- up to three
@@ -107,11 +107,11 @@ struct affine {
 };
 
 /**
- * @brief Iterate-mode descriptor (D9 -- hard-stopped).
+ * @brief Iterate-mode descriptor (hard-stopped).
  *
  * Constructible so call sites compile, but passing it to a verb is a
  * compile-time hard-stop: the iterate sub-field offsets are unverified and
- * the functional model tags iterate as untested. See the design doc D9.
+ * the functional model tags iterate as untested. See the design doc.
  */
 struct iterate {
     uint32_t lds_inc = 0, gbl_inc = 0, count = 0;
@@ -122,7 +122,7 @@ struct iterate {
 };
 
 /* ============================================================ *
- *  Internal descriptor POD + single encode point (D3, D10)
+ *  Internal descriptor POD + single encode point
  * ============================================================ */
 
 namespace detail {
@@ -143,7 +143,7 @@ struct pad_of<S, std::void_t<decltype(S::pad_interval)>> {
 };
 
 /**
- * @brief The one internal descriptor (D3). All arrays are innermost-first.
+ * @brief The one internal descriptor. All arrays are innermost-first.
  *
  * Groups 0-1 carry the common control word, the two innermost tensor dims,
  * the two innermost tile dims and innermost stride; the tagged union carries
@@ -430,14 +430,14 @@ template<int N = 0>
 __device__ __forceinline__ void store_async_wait() { sync::wait_tdm<N>(); }
 
 /* ============================================================ *
- *  Gather streaming range (D6)
+ *  Gather streaming range
  * ============================================================ */
 
 /// @brief One chunk of a gather stream: a span of `n` row indices.
 struct gather_chunk { const uint32_t* rows; int n; };
 
 /**
- * @brief Range over a row-index array yielding per-descriptor chunks (D6).
+ * @brief Range over a row-index array yielding per-descriptor chunks.
  *
  * Splits `total` indices into chunks of the per-descriptor cap (16 for b16,
  * 8 for b32). Compose with `load_tdm` + a destination ring + a barrier ring;
@@ -465,12 +465,12 @@ struct gather_stream {
 } // namespace tdm
 
 /* ============================================================ *
- *  Public verbs (kittens::) -- mode dispatched by argument type (D2)
+ *  Public verbs (kittens::) -- mode dispatched by argument type
  * ============================================================ */
 
 /* ----------  DENSE / AFFINE LOAD (G -> LDS)  ---------- */
 
-/// @brief N-D affine TDM load. Pass `tdm::affine` for axes 2-4 (D4).
+/// @brief N-D affine TDM load. Pass `tdm::affine` for axes 2-4.
 template<typename T, int ROWS, int COLS, ducks::st_shape::all Shape,
          ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
 __device__ inline void load_tdm(
@@ -583,7 +583,7 @@ __device__ inline void load_tdm(
 /**
  * @brief Row-indexed scatter store: write LDS rows back to `M[rows[i]]`.
  *
- * Same descriptor as gather with the store verb (D2). An out-of-range
+ * Same descriptor as gather with the store verb. An out-of-range
  * destination index is skipped by the HW rather than zero-filled.
  */
 template<typename T, int ROWS, int COLS, ducks::st_shape::all Shape,
@@ -614,13 +614,13 @@ __device__ inline void store_tdm(
     __builtin_amdgcn_tensor_store_from_lds(g0, g1, g2, g3, 0);
 }
 
-/* ----------  ITERATE -- HARD-STOP (D9)  ---------- */
+/* ----------  ITERATE -- HARD-STOP  ---------- */
 
 namespace tdm { namespace detail {
 template<typename> struct iterate_hardstop : std::false_type {};
 } }
 
-/// @brief Iterate mode is hard-stopped (D9): passing `tdm::iterate` won't compile.
+/// @brief Iterate mode is hard-stopped: passing `tdm::iterate` won't compile.
 template<typename T, int ROWS, int COLS, ducks::st_shape::all Shape,
          ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
 __device__ inline void load_tdm(
@@ -628,7 +628,7 @@ __device__ inline void load_tdm(
     const tdm::iterate&, const tdm::tdm_opts& = {})
 {
     static_assert(tdm::detail::iterate_hardstop<T>::value,
-        "tdm::iterate is hard-stopped (design decision D9): the iterate "
+        "tdm::iterate is hard-stopped: the iterate "
         "sub-field offsets are unverified and the functional model tags "
         "iterate as untested. Issue separate descriptors per tile instead.");
 }
