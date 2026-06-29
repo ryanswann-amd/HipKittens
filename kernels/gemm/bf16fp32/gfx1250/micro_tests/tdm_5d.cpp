@@ -30,10 +30,14 @@ void tdm_5d_kernel(const gl<bf16, -1, -1, -1, -1> src,
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
+    // Innermost D1xD0 plane lives in `tile`; the 8 (D4*D3*D2) planes the engine
+    // writes are backed by this larger flat buffer and read back flat.
     bf16(&buf)[TILE_ELEMS] = al.allocate_in<segment<0>, bf16, TILE_ELEMS>();
     auto& tile = *reinterpret_cast<st<bf16, D1, D0, NoPad>*>(&buf[0]);
 
-    // Three outer axes (innermost-first: axis2, axis3, axis4).
+    // Three outer axes, each a (extent, element-stride, tile) triple. Strides
+    // are cumulative products of the tensor's inner extents: axis2 steps over a
+    // full T1xT0 plane, axis3 over T2 planes, axis4 over T3*T2 planes.
     auto a = tdm::affine::make(
         /*dim2=*/T2, /*stride2=*/T1 * T0,           /*tile2=*/D2,
         /*dim3=*/T3, /*stride3=*/T2 * T1 * T0,      /*tile3=*/D3,

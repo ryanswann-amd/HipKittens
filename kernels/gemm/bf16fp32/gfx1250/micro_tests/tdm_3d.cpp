@@ -33,10 +33,17 @@ void tdm_3d_kernel(const gl<bf16, -1, -1, -1, -1> src,
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
+    // The `st` describes only the innermost ROWSxCOLS plane, but the engine
+    // writes BATCH such planes back-to-back, so back the tile with a buffer
+    // sized for all of them and read it flat.
     bf16(&buf)[TILE_ELEMS] = al.allocate_in<segment<0>, bf16, TILE_ELEMS>();
     auto& tile = *reinterpret_cast<st<bf16, ROWS, COLS, NoPad>*>(&buf[0]);
 
-    // One extra axis (batch): extent=TB, element-stride=TR*TC, tile count=BATCH.
+    // One extra (outer) axis = the batch dimension. Its descriptor triple is
+    // (extent, element-stride, tile count): extent TB is the tensor's batch
+    // size (for OOB clamping), the stride is one batch plane = TR*TC elements,
+    // and we load BATCH planes. The innermost rows/cols + row stride are
+    // derived from `tile` and `src`, so they are not repeated here.
     auto a = tdm::affine::make(/*dim2=*/TB, /*stride2=*/TR * TC, /*tile2=*/BATCH);
 
     if (warpid() == 0) {

@@ -179,11 +179,39 @@ struct tdm_desc {
 /**
  * @brief The single lowering point: pack a `tdm_desc` into the four operands.
  *
- * Bit positions reproduce the model-validated layout (see file header).
+ * Bit positions reproduce the model-validated layout (see file header). The
+ * descriptor is a 640-bit value spread across four SGPR operands -- group 0
+ * (4 DWords), group 1 (8 DWords), group 2 (4 DWords), group 3 (4 DWords) --
+ * consumed by `tensor_load_to_lds` / `tensor_store_from_lds`. Multi-byte
+ * fields are little-endian and several straddle a DWord boundary, so the
+ * packing below masks/shifts each field into one or two adjacent DWords.
+ *
+ * Field map (innermost-first numbering; "tdimK"/"tstrideK"/"tileK" are the
+ * K-th dimension counting from the contiguous/innermost axis outward):
+ *
+ *   g0[0]  bit0     = pred (must be 1 or the op is a no-op)
+ *          bit30    = gather index size (0 = u16, 1 = u32)
+ *          bit31    = gather enable (0 = dense/affine, 1 = gather/scatter)
+ *   g0[1]  = LDS byte address (dst for load, src for store)
+ *   g0[2]  = global address bits [31:0]
+ *   g0[3]  bits[24:0]  = global address bits [56:32]
+ *          bits[31:30] = type field = 0x2
+ *   g1[0]  bits[15:0]  = multicast workgroup mask (load only)
+ *          bits[17:16] = data_size (log2 bytes/elem: 0=1B,1=2B,2=4B,3=8B)
+ *          bit18       = atomic_barrier_enable (auto-arrive)
+ *          bit20       = pad_enable
+ *          bits[24:22] = pad_interval (log2 dwords - 1)
+ *          bits[30:25] = pad_amount   (dwords - 1)
+ *   g1[1..4]  = barrier addr (low 16b) + tdim0/tdim1 + tile0/1/2
+ *   g1[5..7]  = tstride0 (64b) + tstride1 (48b)
+ *   g2/g3     = tdim2/3/4, tstride2/3, tile3/4  (affine)  -- OR --
+ *               16 u16 / 8 u32 packed row indices         (gather)
  */
 __device__ __forceinline__ void encode(
     const tdm_desc& d, v4u32& g0, v8u32& g1, v4u32& g2, v4u32& g3)
 {
+    // Start from all-zero so every unfilled field (higher dims on low-rank
+    // tiles, the unused union half, etc.) is a defined zero, not garbage.
     g0 = v4u32{0, 0, 0, 0};
     g1 = v8u32{0, 0, 0, 0, 0, 0, 0, 0};
     g2 = v4u32{0, 0, 0, 0};
@@ -192,43 +220,54 @@ __device__ __forceinline__ void encode(
     const bool gather = (d.mode == tdm_mode::gather);
 
     // ---- group 0: pred, gather flags, lds_addr, global_addr, type ----
+    // pred=1 is mandatory; the two MSBs select gather mode and index width.
     g0[0] = 1u                                                   // pred = 1
           | (gather ? (1u << 31) : 0u)                           // gather enable
           | ((gather && d.addr.gat.idx_32bit) ? (1u << 30) : 0u);// index size
-    g0[1] = d.lds_addr;
-    g0[2] = uint32_t(d.base);
-    g0[3] = (uint32_t(d.base >> 32) & 0x01FFFFFFu) | (2u << 30); // type = 0x2
+    g0[1] = d.lds_addr;                                          // LDS byte addr
+    g0[2] = uint32_t(d.base);                                    // global addr [31:0]
+    // The global address is 57 bits: low 32 go in g0[2], the next 25 in g0[3]
+    // bits[24:0]; the top two bits of g0[3] hold the constant type field (0x2).
+    g0[3] = (uint32_t(d.base >> 32) & 0x01FFFFFFu) | (2u << 30); // addr[56:32] | type
 
     // ---- group 1 word 0: control (data_size, pad, barrier, multicast) ----
+    // bit18 turns on the TDM auto-arrive (DS async-barrier) when an LDS
+    // barrier address was supplied; otherwise the caller drains TENSORcnt.
     const uint32_t bar_enable = (d.bar_lds_addr != 0) ? (1u << 18) : 0u;
     uint32_t pad_enable = 0, pad_int_enc = 0, pad_amt_enc = 0;
     if (d.pad_interval > 0) {
+        // The HW expresses padding in DWords, not elements, so convert via
+        // the element size. interval is stored log2-1 and amount is stored
+        // minus-1 (both per SP3); e.g. bf16 <128,8> -> interval 5, amount 3.
         const uint32_t bytes = 1u << d.data_size_log2;
         pad_enable  = 1u;
-        // pad_interval encoded as log2(interval_in_dwords) - 1 (SP3).
         pad_int_enc = __builtin_ctz(uint32_t(d.pad_interval) * bytes / 4u) - 1u;
-        // pad_amount encoded as amount_in_dwords - 1.
         pad_amt_enc = uint32_t(d.pad_amount) * bytes / 4u - 1u;
     }
-    g1[0] = (uint32_t(d.cluster_mask) & 0xFFFFu)
-          | (uint32_t(d.data_size_log2) << 16)
-          |  bar_enable
-          | (pad_enable  << 20)
-          | (pad_int_enc << 22)
-          | (pad_amt_enc << 25);
+    g1[0] = (uint32_t(d.cluster_mask) & 0xFFFFu)   // [15:0]  multicast mask
+          | (uint32_t(d.data_size_log2) << 16)     // [17:16] data_size
+          |  bar_enable                            // [18]    auto-arrive
+          | (pad_enable  << 20)                    // [20]    pad_enable
+          | (pad_int_enc << 22)                    // [24:22] pad_interval
+          | (pad_amt_enc << 25);                   // [30:25] pad_amount
 
     if (gather) {
+        // Gather/scatter is always 2D. tile_dim0 = columns per row,
+        // tile_dim1 = number of rows the HW will read indices for (== n).
         const auto& g = d.addr.gat;
         const uint32_t tdim0 = g.tensor_cols, tdim1 = g.tensor_rows;
         const uint32_t til0 = g.row_len,      til1  = g.n;
+        // tdim0/tdim1 are 32-bit but their fields begin at bit 16 of g1[1]/g1[2],
+        // so each splits across two DWords (low 16 here, high 16 next word).
         g1[1] = (uint32_t(d.bar_lds_addr) & 0xFFFFu) | (tdim0 << 16);
         g1[2] = (tdim0 >> 16) | (tdim1 << 16);
         g1[3] = (tdim1 >> 16) | (til0 << 16);
         g1[4] = til1;
-        const uint64_t s0 = uint32_t(g.row_stride);
+        const uint64_t s0 = uint32_t(g.row_stride);  // stride between source rows
         g1[5] = uint32_t(s0);
         g1[6] = uint32_t(s0 >> 32);
-        // groups 2-3: packed row indices.
+        // groups 2-3 carry the packed row-index list instead of higher dims
+        // (mutually exclusive with the affine layout below).
         g2[0] = g.rows_packed[0]; g2[1] = g.rows_packed[1];
         g2[2] = g.rows_packed[2]; g2[3] = g.rows_packed[3];
         g3[0] = g.rows_packed[4]; g3[1] = g.rows_packed[5];
@@ -237,37 +276,50 @@ __device__ __forceinline__ void encode(
     }
 
     // ---- affine / dense: innermost-first dims & strides ----
+    // `rank` controls how many dims are live; the `if constexpr`-style guards
+    // here are runtime but every higher field defaults to the zero we wrote
+    // above, so a rank-2 (dense) descriptor leaves g2/g3 at zero.
     const auto& a = d.addr.aff;
     const int rank = d.rank;
-    const uint32_t tdim0 = a.tdim[0];
-    const uint32_t tdim1 = (rank >= 2) ? a.tdim[1] : 0u;
-    const uint16_t til0  = a.tile[0];
-    const uint16_t til1  = (rank >= 2) ? a.tile[1] : 0;
-    const uint16_t til2  = (rank >= 3) ? a.tile[2] : 0;
+    const uint32_t tdim0 = a.tdim[0];                       // innermost extent (cols)
+    const uint32_t tdim1 = (rank >= 2) ? a.tdim[1] : 0u;    // next extent (rows)
+    const uint16_t til0  = a.tile[0];                       // innermost tile (cols)
+    const uint16_t til1  = (rank >= 2) ? a.tile[1] : 0;     // next tile (rows)
+    const uint16_t til2  = (rank >= 3) ? a.tile[2] : 0;     // axis-2 tile
 
+    // Same straddling layout as the gather case: tdim0/tdim1 each span two
+    // DWords starting at bit 16; tile0 rides the top half of g1[3].
     g1[1] = (uint32_t(d.bar_lds_addr) & 0xFFFFu) | (tdim0 << 16);
     g1[2] = (tdim0 >> 16) | (tdim1 << 16);
     g1[3] = (tdim1 >> 16) | (uint32_t(til0) << 16);
     g1[4] = uint32_t(til1) | (uint32_t(til2) << 16);
 
     if (rank >= 2) {
+        // tstride0 = elements between innermost rows; a full 64-bit field.
         const uint64_t s0 = a.tstride[0];
         g1[5] = uint32_t(s0);
         g1[6] = uint32_t(s0 >> 32);
     }
     if (rank >= 3) {
+        // tstride1 = elements between axis-1 planes; 48-bit, low 16 share
+        // g1[6]'s high half, the remaining 32 fill g1[7].
         const uint64_t s1 = a.tstride[1];
         g1[6] |= (uint32_t(s1) & 0xFFFFu) << 16;
         g1[7]  =  uint32_t(s1 >> 16);
-        g2[0]  = a.tdim[2];
+        g2[0]  = a.tdim[2];                                 // axis-2 extent (32-bit)
     }
     if (rank >= 4) {
-        g2[1] = a.tdim[3];
+        g2[1] = a.tdim[3];                                 // axis-3 extent (32-bit)
+        // tstride2 = 48-bit: low 32 in g2[2], high 16 in g2[3][15:0];
+        // tile3 occupies g2[3][31:16].
         const uint64_t s2 = a.tstride[2];
         g2[2] = uint32_t(s2);
         g2[3] = (uint32_t(s2 >> 32) & 0xFFFFu) | (uint32_t(a.tile[3]) << 16);
     }
     if (rank == 5) {
+        // The outermost axis is the most fragmented: tstride3 is 48-bit
+        // (low 32 in g3[0], high 16 in g3[1][15:0]); tdim4 is 32-bit split
+        // across g3[1][31:16] and g3[2][15:0]; tile4 sits in g3[2][31:16].
         const uint64_t s3 = a.tstride[3];
         g3[0] = uint32_t(s3);
         g3[1] = (uint32_t(s3 >> 32) & 0xFFFFu) | ((a.tdim[4] & 0xFFFFu) << 16);
@@ -291,27 +343,41 @@ __device__ __forceinline__ const T* tile_base(const GL& src, const COORD& idx) {
             * src.cols() + gc_base);
 }
 
-/// @brief Fill the innermost-first dims/strides shared by dense and affine.
+/**
+ * @brief Fill the innermost-first dims/strides shared by dense and affine.
+ *
+ * This is where "derive by default" happens: the innermost two axes are read
+ * off the tile (`ST::rows`/`ST::cols`) and the source layout (`gl`), so the
+ * caller never repeats them. The outer axes (2..4), which cannot be inferred,
+ * come straight from the `tdm::affine` value.
+ *
+ * Index mapping between the two conventions:
+ *   - descriptor arrays are innermost-first: index 0 = contiguous axis.
+ *   - `affine` exposes axes outward as dim/stride/tile triples, so its k-th
+ *     extra axis lands at descriptor index 2+k, and its k-th stride at
+ *     tstride index 1+k (tstride[0] is always the innermost row stride).
+ */
 template<typename ST, ducks::gl::all GL>
 __device__ __forceinline__ void fill_affine_dims(
     tdm_desc& d, const GL& src, const affine& a)
 {
     d.mode = tdm_mode::affine;
-    d.rank = uint8_t(2 + a.ndim);
+    d.rank = uint8_t(2 + a.ndim);           // 2 innermost + ndim outer axes
     auto& af = d.addr.aff;
+    // Clear all slots first; encode() reads every index up to `rank`.
     #pragma unroll
     for (int i = 0; i < 5; ++i) { af.tdim[i] = 0; af.tile[i] = 0; }
     #pragma unroll
     for (int i = 0; i < 4; ++i) { af.tstride[i] = 0; }
 
-    // innermost two axes (derived from the tile + tensor)
-    af.tdim[0] = uint32_t(src.cols());
-    af.tdim[1] = uint32_t(src.rows());
-    af.tile[0] = uint16_t(ST::cols);
-    af.tile[1] = uint16_t(ST::rows);
+    // Innermost two axes derived from the tile (LDS shape) + tensor (gl).
+    af.tdim[0] = uint32_t(src.cols());                            // axis-0 extent
+    af.tdim[1] = uint32_t(src.rows());                            // axis-1 extent
+    af.tile[0] = uint16_t(ST::cols);                             // axis-0 tile width
+    af.tile[1] = uint16_t(ST::rows);                            // axis-1 tile height
     af.tstride[0] = uint64_t(uint32_t(src.template stride<2>()));  // row stride (elems)
 
-    // outer axes (from the affine value)
+    // Outer axes (2..4) copied verbatim from the affine descriptor.
     #pragma unroll
     for (int k = 0; k < 3; ++k) {
         if (k < a.ndim) {
@@ -322,7 +388,14 @@ __device__ __forceinline__ void fill_affine_dims(
     }
 }
 
-/// @brief Pack up to `cap` row indices into the 8 group-2/3 index words.
+/**
+ * @brief Pack up to `cap` row indices into the 8 group-2/3 index words.
+ *
+ * The HW row capacity is fixed by the index width: 16 rows of u16 (two per
+ * DWord) or 8 rows of u32 (one per DWord), so the same 8 DWords (g2[0..3],
+ * g3[0..3]) hold either packing. Slots past `n` stay zero; `encode` only
+ * lets the HW read `n` of them via tile_dim1.
+ */
 __device__ __forceinline__ void pack_rows(
     tdm_desc& d, const uint32_t* rows, int n, idx_width w)
 {
@@ -331,13 +404,13 @@ __device__ __forceinline__ void pack_rows(
     for (int i = 0; i < 8; ++i) g.rows_packed[i] = 0;
     g.idx_32bit = (w == idx_width::b32);
     if (w == idx_width::b16) {
-        // 2 indices per DWord, 16 max.
+        // u16 mode: 2 indices per DWord (even index -> low half, odd -> high).
         for (int i = 0; i < n && i < 16; ++i) {
             const uint32_t v = uint32_t(rows[i]) & 0xFFFFu;
             g.rows_packed[i >> 1] |= v << (16 * (i & 1));
         }
     } else {
-        // 1 index per DWord, 8 max.
+        // u32 mode: 1 index per DWord, 8 rows max.
         for (int i = 0; i < n && i < 8; ++i) g.rows_packed[i] = uint32_t(rows[i]);
     }
 }
@@ -376,10 +449,13 @@ struct gather_stream {
         : rows(r), total(n), cap(w == idx_width::b16 ? 16 : 8) {}
     struct iterator {
         const uint32_t* rows; int off, total, cap;
+        // Current chunk: a `cap`-sized window, clamped on the final partial one.
         __host__ __device__ gather_chunk operator*() const {
             int n = total - off; if (n > cap) n = cap; return {rows + off, n};
         }
         __host__ __device__ iterator& operator++() { off += cap; return *this; }
+        // The end sentinel is ignored on purpose: a range-for stops as soon as
+        // `off` reaches `total`, which is all this loop needs to test.
         __host__ __device__ bool operator!=(const iterator&) const { return off < total; }
     };
     __host__ __device__ iterator begin() const { return {rows, 0, total, cap}; }
@@ -401,14 +477,17 @@ __device__ inline void load_tdm(
     st<T, ROWS, COLS, Shape>& dst, const GL& src, const COORD& idx,
     const tdm::affine& a, const tdm::tdm_opts& opts = {})
 {
+    // Assemble the descriptor entirely from derived data + the opts/affine
+    // values, then lower it once. `base` is the global address of this tile's
+    // top-left corner; `lds_addr` is where the engine deposits the tile.
     tdm::detail::tdm_desc d;
     d.base = reinterpret_cast<uint64_t>(
         tdm::detail::tile_base<ROWS, COLS, T, GL, COORD>(src, idx));
     d.lds_addr = uint32_t(reinterpret_cast<uintptr_t>(&dst.data[0]));
-    d.data_size_log2 = tdm::detail::data_size_log2<T>();
-    d.cluster_mask = uint16_t(opts.cluster);
-    d.bar_lds_addr = uint32_t(reinterpret_cast<uintptr_t>(opts.arrive));
-    d.pad_interval = uint16_t(tdm::detail::pad_of<Shape>::interval);
+    d.data_size_log2 = tdm::detail::data_size_log2<T>();        // from element type
+    d.cluster_mask = uint16_t(opts.cluster);                   // multicast (load only)
+    d.bar_lds_addr = uint32_t(reinterpret_cast<uintptr_t>(opts.arrive));  // auto-arrive
+    d.pad_interval = uint16_t(tdm::detail::pad_of<Shape>::interval);  // from st shape
     d.pad_amount   = uint16_t(tdm::detail::pad_of<Shape>::amount);
     d.dir = tdm::detail::tdm_dir::load;
     tdm::detail::fill_affine_dims<st<T, ROWS, COLS, Shape>, GL>(d, src, a);

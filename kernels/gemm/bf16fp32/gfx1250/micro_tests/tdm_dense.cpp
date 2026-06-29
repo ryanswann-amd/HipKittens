@@ -31,9 +31,14 @@ void tdm_dense_kernel(const gl<bf16, -1, -1, -1, -1> src,
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
+    // Allocate a flat LDS buffer and view it as an `st` (a non-padded shape, so
+    // `st::data` is plain row-major contiguous). TDM writes the tile contiguously
+    // into `&tile.data[0]`, so we can both pass `tile` to the verb and read the
+    // result back as a flat array -- the layout the engine produced.
     bf16(&buf)[TILE_ELEMS] = al.allocate_in<segment<0>, bf16, TILE_ELEMS>();
     auto& tile = *reinterpret_cast<st<bf16, ROWS, COLS, NoPad>*>(&buf[0]);
 
+    // One warp issues the descriptor; the wait drains TENSORcnt to 0.
     if (warpid() == 0) {
         load_tdm(tile, src, {0, 0, 0, 0});
         tdm::load_async_wait();
