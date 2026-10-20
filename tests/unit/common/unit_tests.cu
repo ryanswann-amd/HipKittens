@@ -40,5 +40,5 @@ int main(int argc, char **argv) {
     std::cout << passes   << " tests passed\n";
     std::cout << fails    << " tests failed\n";
 
-    return 0;
+    return fails > 0;
 }

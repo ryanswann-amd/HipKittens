@@ -1,0 +1,46 @@
+# Unit tests that fail under rocjitsu's gfx950 model (tests/unit/cdna4) in the CI image and are
+# not yet confirmed on real MI355X. run.sh fails CI only on failures NOT listed here.
+# One test label per line, exactly as printed under "Failed tests:".
+#
+# All are shared->register load/store into a col-layout register tile; part of the tile comes
+# back as zeros. The set depends on the toolchain: rocjitsu 0.3.0 + ROCm 7.2 fails a different
+# 24 of these shapes (2026-10-20). Suspected emulator gap around the transposing LDS reads,
+# unconfirmed on hardware. Recorded with tritonci/triton-amd-ci:rocm10.2.0a20261012-...-r1.
+shared_reg_loadstore_gmem=bf16_[1x1]_[rt_32x16]_[st_32x16]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[1x1]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[1x2]_[rt_16x32]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[1x2]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[1x2]_[rt_32x32_8]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[1x3]_[rt_16x32]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[1x3]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[1x3]_[rt_32x32_8]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[1x4]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[2x1]_[rt_32x16]_[st_32x16]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[2x1]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[2x2]_[rt_32x16]_[st_32x16]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[2x2]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[2x2]_[rt_32x32_8]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[3x1]_[rt_32x16]_[st_32x16]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[3x1]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[3x2]_[rt_32x16]_[st_32x16]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[4x1]_[rt_32x16]_[st_32x16]_[rt_col_layout]
+shared_reg_loadstore_gmem=bf16_[4x1]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[1x1]_[rt_32x16]_[st_32x16]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[1x1]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[1x2]_[rt_16x32]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[1x2]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[1x2]_[rt_32x32_8]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[1x3]_[rt_16x32]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[1x3]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[1x3]_[rt_32x32_8]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[1x4]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[2x1]_[rt_32x16]_[st_32x16]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[2x1]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[2x2]_[rt_32x16]_[st_32x16]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[2x2]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[2x2]_[rt_32x32_8]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[3x1]_[rt_32x16]_[st_32x16]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[3x1]_[rt_32x16]_[st_32x32]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[3x2]_[rt_32x16]_[st_32x16]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[4x1]_[rt_32x16]_[st_32x16]_[rt_col_layout]
+shared_reg_loadstore_gmem=half_[4x1]_[rt_32x16]_[st_32x32]_[rt_col_layout]

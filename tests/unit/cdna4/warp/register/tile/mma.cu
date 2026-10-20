@@ -184,13 +184,17 @@ struct mma_wrapper_2d {
             // check and cleanup
             this_result.result = validate(d_i, d_o, i_ref, o_ref, this_result.label, W*RT_SHAPE_ACCUM::cols, 0.10); // mma's sometimes produce small errors. this appears to be hardware.
         }
+        else {
+            this_result.result = test_result::INVALID;
+        }
+        results.push_back(this_result);
     };
 };
 template<typename test, typename RT_SHAPE_ACCUM, typename ST_SHAPE=kittens::ducks::st_shape::st_16x16, int MAX_H=8, int MAX_W=8, int NUM_WORKERS=1, typename... args> using mma_sweep_size = loop_h<mma_wrapper_2d, test, RT_SHAPE_ACCUM, ST_SHAPE, MAX_H, MAX_W, NUM_WORKERS, MAX_H, args...>;
 template<typename test, typename RT_SHAPE_ACCUM, typename ST_SHAPE=kittens::ducks::st_shape::st_16x16, int MAX_H=8, int MAX_W=8, typename... args> using mma_sweep_size_warp = mma_sweep_size<test, RT_SHAPE_ACCUM, ST_SHAPE, MAX_H, MAX_W, 1, args...>;
 
 template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE=kittens::ducks::st_shape::st_16x16>
-void test_generator(test_data &results) {
+static void test_generator(test_data &results) {
     constexpr int SIZE = INTENSITY_0 ? 1  :
                          INTENSITY_1 ? 2  :
                          INTENSITY_2 ? 4  : 

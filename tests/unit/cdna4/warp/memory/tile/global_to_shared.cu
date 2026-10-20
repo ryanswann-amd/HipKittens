@@ -43,7 +43,7 @@ using I0_t = std::integral_constant<int, 0>;
 using I1_t = std::integral_constant<int, 1>;
 using I2_t = std::integral_constant<int, 2>;
 template<kittens::ducks::st_shape::all ST_SHAPE, kittens::ducks::rt_shape::all RT_SHAPE=kittens::ducks::rt_shape::rt_16x16>
-void test_generator(test_data &results) {
+static void test_generator(test_data &results) {
     constexpr int SIZE = INTENSITY_0 ? 1  :
                          INTENSITY_1 ? 2  :
                          INTENSITY_2 ? 4  :

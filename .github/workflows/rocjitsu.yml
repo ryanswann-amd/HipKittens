@@ -1,0 +1,90 @@
+# HipKittens unit tests on a CPU-emulated AMD GPU (rocjitsu, ROCm/rocm-systems emulation/rocjitsu).
+#
+# rocjitsu executes the GPU ISA on the CPU behind an LD_PRELOAD KFD/DRM interposer, so the
+# unmodified HIP binaries in tests/unit run on a free GitHub-hosted runner with no GPU. It is
+# functional only: it checks the bytes, never timing, and real hardware stays the authority.
+#
+# Toolchain and emulator both come from Triton's public AMD CI image (TheRock ROCm with rocjitsu
+# packaged as `mirage`), the image triton-lang/triton's integration-tests-amd-rocjitsu job uses,
+# so nothing is built from source. tests/unit/rocjitsu/run.sh builds one section and runs it.
+name: rocjitsu
+
+on:
+  pull_request:
+    paths:
+      - "include/**"
+      - "tests/unit/**"
+      - ".github/workflows/rocjitsu.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rocjitsu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: tritonci/triton-amd-ci:rocm10.2.0a20261012-pytorch2.16.0a0-gfx942-gfx950-gfx1250-r1
+
+jobs:
+  unit:
+    name: ${{ matrix.suite }} ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each shard is its own unit_tests binary. Sized from a 4-CPU sweep (2026-10-20): build is
+        # ~3/4 of the cost, and every shard lands at about 6-10 min on a GitHub-hosted runner.
+        include:
+          - suite: cdna4
+            name: group-tile
+            tests: TEST_GROUP_MEMORY_TILE_GLOBAL_TO_SHARED
+          - suite: cdna4
+            name: warp-memory-tile
+            tests: TEST_WARP_MEMORY_TILE_GLOBAL_TO_REGISTER TEST_WARP_MEMORY_TILE_GLOBAL_TO_SHARED
+          - suite: cdna4
+            name: shared-to-register-and-vec
+            tests: >-
+              TEST_WARP_MEMORY_TILE_SHARED_TO_REGISTER TEST_ALL_WARP_MEMORY_VEC
+              TEST_GROUP_MEMORY_VEC_GLOBAL_TO_SHARED
+          - suite: cdna4
+            name: register-tile-conversions-maps
+            tests: TEST_WARP_REGISTER_TILE_CONVERSIONS TEST_WARP_REGISTER_TILE_MAPS
+          - suite: cdna4
+            name: register-tile-reductions-mma
+            tests: >-
+              TEST_WARP_REGISTER_TILE_REDUCTIONS TEST_WARP_REGISTER_TILE_MMA
+              TEST_WARP_REGISTER_TILE_MMA_SCALED TEST_WARP_REGISTER_TILE_MMA_SCALED_ART
+          - suite: cdna4
+            name: register-vec-and-shared
+            tests: TEST_ALL_WARP_REGISTER_VEC TEST_ALL_WARP_SHARED
+          # TEST_WARP_MEMORY_TILE_GLOBAL_TO_SHARED is left out: it does not compile against the
+          # current cdna5 headers (kittens::load_async moved to kittens::tdm).
+          - suite: cdna5
+            name: warp-memory-tile
+            tests: TEST_WARP_MEMORY_TILE_GLOBAL_TO_REGISTER TEST_WARP_MEMORY_TILE_SHARED_TO_REGISTER
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk for the 14 GB image
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af >/dev/null
+          df -h /
+      - name: Pull image
+        run: docker pull -q "$IMAGE"
+      - name: Build and run on simulated ${{ matrix.suite == 'cdna4' && 'gfx950' || 'gfx1250' }}
+        run: |
+          docker run --rm --init --user "$(id -u):$(id -g)" -e HOME=/tmp/home \
+            -v "$PWD:/work" -w /work "$IMAGE" \
+            tests/unit/rocjitsu/run.sh ${{ matrix.suite }} results ${{ matrix.tests }}
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocjitsu-${{ matrix.suite }}-${{ matrix.name }}
+          path: results/
+          retention-days: 14

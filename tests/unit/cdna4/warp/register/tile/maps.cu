@@ -63,7 +63,7 @@ struct test_dgelu {
 };
 
 template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE=kittens::ducks::st_shape::st_16x16>
-void test_generator(test_data &results) {
+static void test_generator(test_data &results) {
     constexpr int SIZE = INTENSITY_0 ? 1  :
                          INTENSITY_1 ? 2  :
                          INTENSITY_2 ? 4  :
