@@ -156,8 +156,8 @@ __device__ inline static void load(RT &dst, const ST &src) {
                             asm volatile(
                                 "ds_read_b64 %0, %2 offset:%4\n"
                                 "ds_read_b64 %1, %3 offset:%4\n"
-                                : "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx])),
-                                  "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx + 2]))
+                                : "=&v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx])),
+                                  "=&v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx + 2]))
                                 : "v"(addr), "v"(next_addr), "i"(offset)
                                 : "memory"
                             );
@@ -260,8 +260,8 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                         "ds_read_b64_tr_b16 %0, %2 offset:%3\n"
                                         "ds_read_b64_tr_b16 %1, %2 offset:%4\n"
                                         // "s_waitcnt lgkmcnt(0)\n"
-                                        : "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx])), 
-                                        "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx + 2]))
+                                        : "=&v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx])), 
+                                        "=&v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx + 2]))
                                         : "v"(addr), "i"(offset), "i"(offset + 4 * ST::underlying_subtile_row_bytes)
                                         : "memory"
                                     );
@@ -271,8 +271,8 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                         "ds_read_b64_tr_b16 %0, %2 offset:%4\n"
                                         "ds_read_b64_tr_b16 %1, %3 offset:%4\n"
                                         // "s_waitcnt lgkmcnt(0)\n"
-                                        : "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx])), 
-                                        "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx + 2]))
+                                        : "=&v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx])), 
+                                        "=&v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx + 2]))
                                         : "v"(addr), "v"(next_addr), "i"(offset)
                                         : "memory"
                                     );
@@ -342,8 +342,8 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                     asm volatile(
                                         "ds_read_b64_tr_b16 %0, %2 offset:%4\n"
                                         "ds_read_b64_tr_b16 %1, %3 offset:%4\n"
-                                        : "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx])), 
-                                        "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx + 2]))
+                                        : "=&v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx])), 
+                                        "=&v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx + 2]))
                                         : "v"(addr), "v"(next_addr), "i"(offset)
                                         : "memory"
                                     );
@@ -398,8 +398,8 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                 asm volatile(
                                     "ds_read_b64_tr_b16 %0, %2 offset:%4\n"
                                     "ds_read_b64_tr_b16 %1, %3 offset:%4\n"
-                                    : "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx])), 
-                                    "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx + 2]))
+                                    : "=&v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx])), 
+                                    "=&v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx + 2]))
                                     : "v"(addr), "v"(next_addr), "i"(offset)
                                     : "memory"
                                 );
